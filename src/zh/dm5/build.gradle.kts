@@ -6,9 +6,10 @@ plugins {
 
 keiyoushi {
     name = "Dm5"
-    versionCode = 10
+    versionCode = 3
     contentWarning = ContentWarning.MIXED
-    libVersion = "1.4"
+    libVersion = "1.6"
+    theme = "dm5"
 
     source {
         lang = "zh"
@@ -21,8 +22,11 @@ keiyoushi {
             )
         }
     }
-}
 
-dependencies {
-    implementation(project(":lib:unpacker"))
+    deeplink {
+        host("www.dm5.com")
+        host("www.dm5.cn")
+        host("m.dm5.com")
+        path("/m..*")
+    }
 }

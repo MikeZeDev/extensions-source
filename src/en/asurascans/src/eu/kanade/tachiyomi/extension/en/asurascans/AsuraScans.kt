@@ -14,12 +14,14 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
-import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
 import keiyoushi.network.get
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
+import keiyoushi.utils.asJsoup
 import keiyoushi.utils.getPreferences
+import keiyoushi.utils.intOrNull
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.string
 import keiyoushi.utils.toJsonElement
@@ -51,7 +53,6 @@ import kotlin.time.Duration.Companion.seconds
 abstract class AsuraScans :
     KeiSource(),
     ConfigurableSource {
-
     private val apiUrl = "https://api.asurascans.com/api"
 
     private val preferences: SharedPreferences = getPreferences {
@@ -102,7 +103,7 @@ abstract class AsuraScans :
             }
         }.build()
 
-        client.get(url).use { response ->
+        client.get(url, Fetch.XHR).use { response ->
             val result = response.parseAs<DataDto<List<MangaDto>>>()
             val mangas = result.data.orEmpty().map { it.toSManga(baseUrl) }
             return MangasPage(mangas, result.meta!!.hasMore)
@@ -145,12 +146,12 @@ abstract class AsuraScans :
         fetchChapters: Boolean,
     ): SMangaUpdate {
         val url = getMangaUrl(manga)
-        var response = client.get(url, ensureSuccess = false)
+        var response = client.get(url, Fetch.DOCUMENT, ensureSuccess = false)
 
         // retry without random suffix, it redirects to new random suffix
         if (!response.isSuccessful) {
             response.close()
-            response = client.get(url.replace(URL_RANDOM_PART, ""))
+            response = client.get(url.replace(URL_RANDOM_PART, ""), Fetch.DOCUMENT)
         }
 
         response.use { response ->
@@ -175,7 +176,7 @@ abstract class AsuraScans :
     override val supportsRelatedMangas get() = true
 
     override suspend fun fetchRelatedMangaList(manga: SManga): List<SManga> {
-        client.get(getMangaUrl(manga)).use { response ->
+        client.get(getMangaUrl(manga), Fetch.DOCUMENT).use { response ->
             val document = response.asJsoup()
 
             return document.select("h2:contains(recommended) + div a[href*=/comics/]").mapNotNull { el ->
@@ -210,7 +211,7 @@ abstract class AsuraScans :
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         val url = getChapterUrl(chapter)
 
-        client.get(url).use { response ->
+        client.get(url, Fetch.DOCUMENT).use { response ->
             val document = response.asJsoup()
             var pages = try {
                 document.extractAstroProp<PageListDto>("pages").pages
@@ -236,7 +237,7 @@ abstract class AsuraScans :
                     .build()
 
                 pages = try {
-                    client.get(url, headers).use { premiumResponse ->
+                    client.get(url, headers, Fetch.XHR).use { premiumResponse ->
                         premiumResponse.parseAs<PremiumPageListDto>().data.chapter.pages
                     }
                 } catch (_: Exception) {
@@ -269,13 +270,13 @@ abstract class AsuraScans :
 
     override suspend fun fetchFilterData(): JsonElement = coroutineScope {
         val genres = async {
-            client.get("$baseUrl/browse")
+            client.get("$baseUrl/browse", Fetch.DOCUMENT)
                 .extractAstroProp<AvailableGenres>("availableGenres")
                 .availableGenres
         }
 
         val creators = async {
-            client.get("$apiUrl/creators").parseAs<DataDto<Creators>>().data!!
+            client.get("$apiUrl/creators", Fetch.XHR).parseAs<DataDto<Creators>>().data!!
         }
 
         FiltersDto(
@@ -390,8 +391,10 @@ abstract class AsuraScans :
     private fun JsonElement.unwrapAstro(): JsonElement = when (this) {
         is JsonArray -> when {
             isEmpty() -> JsonNull
-            size == 1 -> JsonNull
-            size == 2 && this[0] is JsonPrimitive -> this[1].unwrapAstro()
+            size == 1 && (this[0] as? JsonPrimitive)?.intOrNull != null ->
+                JsonNull
+            size == 2 && (this[0] as? JsonPrimitive)?.intOrNull != null ->
+                this[1].unwrapAstro()
             else -> JsonArray(map { it.unwrapAstro() })
         }
         is JsonObject -> JsonObject(mapValues { it.value.unwrapAstro() })

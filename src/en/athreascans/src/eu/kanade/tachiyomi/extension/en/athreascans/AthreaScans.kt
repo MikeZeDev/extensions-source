@@ -1,41 +1,23 @@
 package eu.kanade.tachiyomi.extension.en.athreascans
 
-import android.content.SharedPreferences
-import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.multisrc.mangathemesia.MangaThemesia
-import eu.kanade.tachiyomi.multisrc.mangathemesia.MangaThemesiaPaidChapterHelper
-import eu.kanade.tachiyomi.source.ConfigurableSource
-import eu.kanade.tachiyomi.source.model.SChapter
+import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.annotation.Source
 import keiyoushi.network.rateLimit
-import keiyoushi.utils.getPreferences
 import okhttp3.OkHttpClient
-import okhttp3.Response
+import org.jsoup.nodes.Document
 
 @Source
-abstract class AthreaScans :
-    MangaThemesia(),
-    ConfigurableSource {
+abstract class AthreaScans : MangaThemesia() {
 
-    override val client: OkHttpClient = super.client.newBuilder()
-        .rateLimit(2)
-        .build()
+    override fun OkHttpClient.Builder.configureClient() = rateLimit(2)
 
-    private val preferences: SharedPreferences = getPreferences()
-
-    private val paidChapterHelper = MangaThemesiaPaidChapterHelper()
-
-    override fun chapterListSelector(): String = paidChapterHelper.getChapterListSelectorBasedOnHidePaidChaptersPref(
-        super.chapterListSelector(),
-        preferences,
-    )
-
-    override fun chapterListParse(response: Response): List<SChapter> = super.chapterListParse(response).filterNot { chapter ->
-        // Additional filter: skip chapters without valid URLs (locked chapters have no href)
-        chapter.url.isBlank() || chapter.url == "#"
+    override fun mangaDetailsParse(document: Document) = super.mangaDetailsParse(document).apply {
+        // Completed, with chapters still behind coins
+        if (status == SManga.COMPLETED && document.selectFirst("#chapterlist .eph-num a:not([href])") != null) {
+            status = SManga.PUBLISHING_FINISHED
+        }
     }
 
-    override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        paidChapterHelper.addHidePaidChaptersPreferenceToScreen(screen, intl)
-    }
+    override fun chapterListSelector() = "#chapterlist li:has(.eph-num a[href])"
 }

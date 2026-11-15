@@ -7,6 +7,6 @@ dependencies {
 }
 
 keiyoushi {
-    baseVersionCode = 13
-    libVersion = "1.4"
+    baseVersionCode = 1
+    libVersion = "1.6"
 }

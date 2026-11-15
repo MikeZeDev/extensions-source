@@ -1,39 +1,33 @@
 package eu.kanade.tachiyomi.extension.en.comichubfree
 
-import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
-import eu.kanade.tachiyomi.util.asJsoup
+import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
-import keiyoushi.utils.tryParse
+import keiyoushi.network.Fetch
+import keiyoushi.network.get
+import keiyoushi.source.KeiSource
+import keiyoushi.utils.asJsoup
+import keiyoushi.utils.textOrNull
+import keiyoushi.utils.tryParseDate
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Request
-import okhttp3.Response
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import java.text.SimpleDateFormat
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 
 @Source
-abstract class ComicHubFree : HttpSource() {
-    private val dateFormat = SimpleDateFormat("d-MMM-yyyy", Locale.getDefault())
+abstract class ComicHubFree : KeiSource() {
+    private val dateFormat = DateTimeFormatter.ofPattern("d-MMM-yyyy", Locale.ENGLISH)
 
-    override val supportsLatest = true
+    override suspend fun getPopularManga(page: Int) = parsePopular(
+        client.get("$baseUrl/popular-comic?page=$page", Fetch.DOCUMENT).asJsoup(),
+    )
 
-    override fun popularMangaRequest(page: Int): Request {
-        val url = "$baseUrl/popular-comic".toHttpUrl().newBuilder().apply {
-            addQueryParameter("page", page.toString())
-        }.build()
-
-        return GET(url, headers)
-    }
-
-    override fun popularMangaParse(response: Response): MangasPage {
-        val document = response.asJsoup()
-
+    private fun parsePopular(document: Document): MangasPage {
         val mangas = document.select(".movie-list-index > .cartoon-box:has(.detail)").map { element ->
             SManga.create().apply {
                 setUrlWithoutDomain(element.selectFirst("a")!!.absUrl("href"))
@@ -47,30 +41,52 @@ abstract class ComicHubFree : HttpSource() {
         return MangasPage(mangas, hasNextPage)
     }
 
-    override fun latestUpdatesRequest(page: Int): Request {
-        val url = "$baseUrl/new-comic".toHttpUrl().newBuilder().apply {
-            addQueryParameter("page", page.toString())
-        }.build()
+    override suspend fun getLatestUpdates(page: Int) = parsePopular(
+        client.get("$baseUrl/new-comic?page=$page", Fetch.DOCUMENT).asJsoup(),
+    )
 
-        return GET(url, headers)
-    }
-
-    override fun latestUpdatesParse(response: Response): MangasPage = popularMangaParse(response)
-
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
         val url = "$baseUrl/search-comic".toHttpUrl().newBuilder().apply {
             addQueryParameter("key", query)
             addQueryParameter("page", page.toString())
         }.build()
-
-        return GET(url, headers)
+        return parsePopular(client.get(url, Fetch.DOCUMENT).asJsoup())
     }
 
-    override fun searchMangaParse(response: Response): MangasPage = popularMangaParse(response)
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
+        val doc = client.get(getMangaUrl(manga), Fetch.DOCUMENT).asJsoup()
+        return SMangaUpdate(parseDetails(doc), if (fetchChapters) parseChapters(doc) else chapters)
+    }
 
-    override fun chapterListParse(response: Response): List<SChapter> {
+    private fun parseDetails(document: Document): SManga {
+        val infoElement = document.selectFirst("div.movie-info") ?: return SManga.create()
+        val seriesInfoElement = infoElement.selectFirst("div.series-info")
+        val seriesDescriptionElement = infoElement.selectFirst("div#film-content")
+
+        val authorElement = seriesInfoElement?.selectFirst("dt:contains(Author:) + dd")
+        val statusElement = seriesInfoElement?.selectFirst("dt:contains(Status:) + dd")
+        val genreElements = seriesInfoElement?.select("dt:contains(Genres:) + dd a")
+
+        val image = seriesInfoElement?.selectFirst("img")
+
+        return SManga.create().apply {
+            description = seriesDescriptionElement?.text()
+            thumbnail_url = image?.imageAttr()
+            author = authorElement?.textOrNull()
+            genre = genreElements?.takeIf { it.isNotEmpty() }?.joinToString { it.text() }
+            status = parseStatus(statusElement?.text().orEmpty())
+        }
+    }
+
+    private suspend fun parseChapters(document: Document): List<SChapter> {
         val chapters = mutableListOf<SChapter>()
-        var document = response.asJsoup()
+
+        var document = document
 
         while (true) {
             document.select("div.episode-list > div > table > tbody > tr").mapTo(chapters) { element ->
@@ -80,7 +96,7 @@ abstract class ComicHubFree : HttpSource() {
                 SChapter.create().apply {
                     setUrlWithoutDomain(urlElement.attr("abs:href"))
                     name = urlElement.text()
-                    date_upload = dateFormat.tryParse(dateElement.text())
+                    date_upload = dateFormat.tryParseDate(dateElement.text())
                 }
             }
 
@@ -88,45 +104,16 @@ abstract class ComicHubFree : HttpSource() {
             if (nextUrl.isNullOrEmpty()) {
                 break
             }
-            document = client.newCall(GET(nextUrl, headers)).execute().asJsoup()
+            document = client.get(nextUrl, Fetch.DOCUMENT).asJsoup()
         }
 
         return chapters
     }
 
-    override fun mangaDetailsParse(response: Response): SManga {
-        val document = response.asJsoup()
-        val infoElement = document.selectFirst("div.movie-info") ?: return SManga.create()
-        val seriesInfoElement = infoElement.selectFirst("div.series-info")
-        val seriesDescriptionElement = infoElement.selectFirst("div#film-content")
-
-        val authorElement = seriesInfoElement?.select("dt:contains(Authors:) + dd")
-        val statusElement = seriesInfoElement?.select("dt:contains(Status:) + dd")
-
-        val image = seriesInfoElement?.selectFirst("img")
-
-        return SManga.create().apply {
-            description = seriesDescriptionElement?.text()
-            thumbnail_url = image?.imageAttr()
-            author = authorElement?.text()
-            status = parseStatus(statusElement?.text().orEmpty())
-        }
-    }
-
-    override fun pageListRequest(chapter: SChapter): Request {
-        val url = (baseUrl + chapter.url + "/all").toHttpUrl()
-
-        return GET(url, headers)
-    }
-
-    override fun pageListParse(response: Response): List<Page> {
-        val document = response.asJsoup()
-        return document.select("img.chapter_img").mapIndexed { index, element ->
+    override suspend fun getPageList(chapter: SChapter) = client.get("$baseUrl${chapter.url}/all", Fetch.DOCUMENT).asJsoup()
+        .select("img.chapter_img").mapIndexed { index, element ->
             Page(index, imageUrl = element.imageAttr())
         }.distinctBy { it.imageUrl }
-    }
-
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException("Not used.")
 
     private fun parseStatus(status: String): Int = when (status) {
         "Ongoing" -> SManga.ONGOING

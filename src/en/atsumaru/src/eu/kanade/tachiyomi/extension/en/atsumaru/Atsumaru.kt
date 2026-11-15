@@ -1,9 +1,9 @@
 package eu.kanade.tachiyomi.extension.en.atsumaru
 
+import androidx.preference.EditTextPreference
 import androidx.preference.MultiSelectListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
-import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
@@ -13,6 +13,7 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
 import keiyoushi.network.get
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
@@ -27,7 +28,6 @@ import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
-import okhttp3.Request
 
 @Source
 abstract class Atsumaru :
@@ -39,7 +39,6 @@ abstract class Atsumaru :
     }
 
     override fun Headers.Builder.configureHeaders() = apply {
-        add("Accept", "*/*")
         add("Content-Type", "application/json")
     }
 
@@ -52,6 +51,7 @@ abstract class Atsumaru :
         val data = client.get(
             "$baseUrl/api/home2/popular?offset=$offset&limit=$BROWSE_LIMIT" +
                 "&types=Manga,Manwha,Manhua,OEL&mediums=Comic&timeframe=daily${get18Mode()}${excludedGenresQuery()}",
+            Fetch.XHR,
         ).parseAs<BrowseMangaDto>()
 
         return MangasPage(data.items.map { it.toSManga(baseUrl) }, true)
@@ -64,6 +64,7 @@ abstract class Atsumaru :
         val data = client.get(
             "$baseUrl/api/home2/recentlyUpdated?offset=$offset&limit=$BROWSE_LIMIT" +
                 "&types=Manga,Manwha,Manhua,OEL&mediums=Comic${get18Mode()}${excludedGenresQuery()}",
+            Fetch.XHR,
         ).parseAs<BrowseMangaDto>()
 
         return MangasPage(data.items.map { it.toSManga(baseUrl) }, true)
@@ -211,7 +212,7 @@ abstract class Atsumaru :
             addQueryParameter("per_page", "40")
         }.build()
 
-        val body = client.get(url).body.string()
+        val body = client.get(url, Fetch.XHR).body.string()
 
         return if (body.contains("\"hits\"")) {
             val data = body.parseAs<SearchResultsDto>()
@@ -240,7 +241,7 @@ abstract class Atsumaru :
     override val supportsFilterFetching = true
 
     override suspend fun fetchFilterData(): JsonElement {
-        val filters = client.get("$baseUrl/api/explore/availableFilters").parseAs<FilterData>()
+        val filters = client.get("$baseUrl/api/explore/availableFilters", Fetch.XHR).parseAs<FilterData>()
         return filters.toJsonElement()
     }
 
@@ -271,7 +272,7 @@ abstract class Atsumaru :
     ): SMangaUpdate = coroutineScope {
         val detailsDeferred = async {
             if (fetchDetails || fetchChapters) {
-                client.get("$baseUrl/api/manga/page?id=${manga.url}")
+                client.get("$baseUrl/api/manga/page?id=${manga.url}", Fetch.XHR)
                     .parseAs<MangaObjectDto>()
                     .mangaPage
             } else {
@@ -280,7 +281,7 @@ abstract class Atsumaru :
         }
         val chaptersDeferred = async {
             if (fetchChapters) {
-                client.get("$baseUrl/api/manga/allChapters?mangaId=${manga.url}")
+                client.get("$baseUrl/api/manga/allChapters?mangaId=${manga.url}", Fetch.XHR)
                     .parseAs<AllChaptersDto>()
             } else {
                 null
@@ -298,7 +299,27 @@ abstract class Atsumaru :
 
         val updatedChapters = if (fetchChapters && chaptersDto != null) {
             val scanlatorMap = details?.scanlators?.associate { it.id to it.name }.orEmpty()
-            chaptersDto.chapters.map {
+            val blacklist = scanlatorBlacklist
+            val filteredChapters = if (blacklist.isEmpty()) {
+                chaptersDto.chapters
+            } else {
+                chaptersDto.chapters.filter { chapter ->
+                    val name = chapter.scanlationMangaId?.let(scanlatorMap::get)
+                    name == null || name.trim().lowercase() !in blacklist
+                }
+            }
+            val chapterDtos = if (deduplicateChapters) {
+                val scores = details?.scanlators?.associate { it.id to it.score }.orEmpty()
+                filteredChapters.groupBy { it.number }.map { (_, uploads) ->
+                    uploads.maxWith(
+                        compareBy<ChapterDto> { scores[it.scanlationMangaId] ?: Int.MIN_VALUE }
+                            .thenBy { it.dateUploadMillis() },
+                    )
+                }
+            } else {
+                filteredChapters
+            }
+            chapterDtos.map {
                 it.toSChapter(manga.url, it.scanlationMangaId?.let { id -> scanlatorMap[id] })
             }.sortedWith(
                 compareByDescending<SChapter> { it.chapter_number }
@@ -314,7 +335,7 @@ abstract class Atsumaru :
 
     override val supportsRelatedMangas = true
 
-    override suspend fun fetchRelatedMangaList(manga: SManga): List<SManga> = client.get("$baseUrl/api/manga/page?id=${manga.url}")
+    override suspend fun fetchRelatedMangaList(manga: SManga): List<SManga> = client.get("$baseUrl/api/manga/page?id=${manga.url}", Fetch.XHR)
         .parseAs<MangaObjectDto>()
         .mangaPage
         .recommendations(baseUrl)
@@ -335,22 +356,14 @@ abstract class Atsumaru :
             .addQueryParameter("chapterId", name)
             .build()
 
-        return client.get(url).parseAs<PageObjectDto>().readChapter.pages.mapIndexed { index, page ->
+        return client.get(url, Fetch.XHR).parseAs<PageObjectDto>().readChapter.pages.mapIndexed { index, page ->
             val imageUrl = when {
                 page.image.startsWith("http") -> page.image
                 page.image.startsWith("//") -> "https:${page.image}"
                 else -> "$baseUrl/static/${page.image.removePrefix("/").removePrefix("static/")}"
             }
-            Page(index, imageUrl = imageUrl.replaceFirst(PROTOCOL_REGEX, "https://"))
+            Page(index, imageUrl = imageUrl.replaceFirst(PROTOCOL_REGEX, "https://cdn."))
         }
-    }
-
-    override fun imageRequest(page: Page): Request {
-        val imgHeaders = headersBuilder().apply {
-            set("Accept", "image/avif,image/webp,*/*")
-        }.build()
-
-        return GET(page.imageUrl!!, imgHeaders)
     }
 
     private fun get18Mode(): String {
@@ -363,6 +376,16 @@ abstract class Atsumaru :
         if (ids.isEmpty()) return ""
         return "&excludedTags=${ids.joinToString(",")}"
     }
+
+    private val deduplicateChapters: Boolean
+        get() = prefs.getBoolean(PREF_DEDUPLICATE_CHAPTERS, false)
+
+    private val scanlatorBlacklist: Set<String>
+        get() = prefs.getString(PREF_SCANLATOR_BLACKLIST, "").orEmpty()
+            .split(",")
+            .map { it.trim().lowercase() }
+            .filter { it.isNotEmpty() }
+            .toSet()
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         SwitchPreferenceCompat(screen.context).apply {
@@ -406,11 +429,28 @@ abstract class Atsumaru :
                 true
             }
         }.let(screen::addPreference)
+
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_DEDUPLICATE_CHAPTERS
+            title = "Deduplicate chapters"
+            summary = "Show one upload per chapter, from the highest rated group that has it"
+            setDefaultValue(false)
+        }.let(screen::addPreference)
+
+        EditTextPreference(screen.context).apply {
+            key = PREF_SCANLATOR_BLACKLIST
+            title = "Excluded scanlators"
+            summary = "Comma-separated group names to exclude from the chapter list"
+            dialogTitle = "Excluded scanlators"
+            setDefaultValue("")
+        }.let(screen::addPreference)
     }
 
     companion object {
         private const val PREF_SHOW_18 = "pref_18_mode"
         private const val PREF_EXCLUDE_GENRES = "pref_exclude_genres"
+        private const val PREF_DEDUPLICATE_CHAPTERS = "pref_deduplicate_chapters"
+        private const val PREF_SCANLATOR_BLACKLIST = "pref_scanlator_blacklist"
         private const val BROWSE_LIMIT = 40
 
         private val PROTOCOL_REGEX = Regex("^https?:?//")

@@ -2,7 +2,7 @@ package eu.kanade.tachiyomi.extension.zh.manwa
 
 import android.content.SharedPreferences
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.utils.asJsoup
 import keiyoushi.utils.toJsonString
 import okhttp3.Interceptor
 import okhttp3.Response
@@ -11,7 +11,6 @@ class ImageSource(
     private val baseUrl: String,
     private val preferences: SharedPreferences,
 ) : Interceptor {
-    @Volatile
     private var isUpdated = false
 
     override fun intercept(chain: Interceptor.Chain): Response {
@@ -26,7 +25,6 @@ class ImageSource(
         return chain.proceed(request)
     }
 
-    @Synchronized
     private fun updateList(chain: Interceptor.Chain): Boolean {
         if (isUpdated) {
             return false

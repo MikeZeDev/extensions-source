@@ -3,6 +3,10 @@ plugins {
 }
 
 keiyoushi {
-    baseVersionCode = 1
-    libVersion = "1.4"
+    baseVersionCode = 4
+    libVersion = "1.6"
+
+    deeplink {
+        path("/mangas/..*")
+    }
 }

@@ -6,15 +6,15 @@ plugins {
 
 keiyoushi {
     name = "Jmanga"
-    versionCode = 3
+    versionCode = 10
     contentWarning = ContentWarning.MIXED
-    libVersion = "1.4"
+    libVersion = "1.6"
     theme = "mangareader"
 
     source {
         lang = "ja"
         baseUrl {
-            custom("https://jmanga.loan")
+            custom("https://jmanga.cloud")
         }
     }
 }

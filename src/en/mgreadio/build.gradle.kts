@@ -8,7 +8,8 @@ keiyoushi {
     name = "Mgread.io"
     versionCode = 1
     contentWarning = ContentWarning.MIXED
-    libVersion = "1.4"
+    libVersion = "1.6"
+    theme = "initmanga"
 
     source {
         lang = "en"

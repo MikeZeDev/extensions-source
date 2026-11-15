@@ -2,7 +2,10 @@ package eu.kanade.tachiyomi.extension.pt.kuromangas
 
 import android.util.Base64
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.network.Fetch
+import keiyoushi.network.fetch
+import keiyoushi.utils.asJsoup
+import keiyoushi.utils.md5
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.readIntBigEndian
 import keiyoushi.utils.readIntLittleEndian
@@ -20,21 +23,22 @@ import java.time.ZoneOffset
 
 const val HOSTNAME_PART = "kuromangas.com::v2"
 const val ANTIBOT = "x9_4v2_b"
-const val DEFAULT_ENC_KEY = "2i3ato8l674shksfE2oMmieshonuYTusF4jKdqEwhUEft9dsadcxzde3"
-const val VERIFY_COOKIE = "kuro_x"
-const val VERIFY_HEADER = "X-Kuro-Verify"
+const val DEFAULT_ENC_KEY = "i9ato8l6sai74jyIHfE2oeshoforanuYTusF4jKdqEwhUEft9dsadcxzsaipnjm8"
+const val TOKEN_COOKIE = "_kn"
+const val TOKEN_HEADER = "X-Client-Token"
+private const val LOGIN_EXPIRED_MESSAGE = "Sessão recusada pelo site. Refaça o login no WebView ou revise email e senha nas configurações."
 
 private val encKeyRegex = Regex("""ENCRYPTION_KEY\s*[:=]\s*["']([^"']+)["']""")
 
-class KuroMangasDecryptor(val baseUrl: String, val client: OkHttpClient) {
+class KuroMangasDecryptor(val baseUrl: String, val client: OkHttpClient, val relogin: () -> Boolean) {
     private var viteApiEncKey: String? = DEFAULT_ENC_KEY
 
     fun vSecureInterceptor() = Interceptor { chain ->
 
         fun newRequest(): Request {
-            val verifyToken = client.getCookie(baseUrl, VERIFY_COOKIE) ?: return chain.request()
+            val token = client.getCookie(baseUrl, TOKEN_COOKIE) ?: return chain.request()
             return chain.request().newBuilder()
-                .header(VERIFY_HEADER, verifyToken)
+                .header(TOKEN_HEADER, token)
                 .build()
         }
 
@@ -42,9 +46,10 @@ class KuroMangasDecryptor(val baseUrl: String, val client: OkHttpClient) {
             val response = chain.proceed(request)
 
             if (response.code == 401 || response.code == 403) {
+                val reason = runCatching { response.peekBody(512).string() }.getOrDefault("")
                 response.close()
-                if (retried) throw IOException("Credentials expired, open webview and retry")
-                reloadCredentials()
+                if (retried) throw IOException("$LOGIN_EXPIRED_MESSAGE (${response.code}) $reason")
+                reloadCredentials(true)
                 return execute(newRequest(), true)
             }
 
@@ -70,13 +75,15 @@ class KuroMangasDecryptor(val baseUrl: String, val client: OkHttpClient) {
         execute(newRequest(), false)
     }
 
-    fun reloadCredentials() {
-        val indexJsUrl = client.newCall(GET(baseUrl)).execute()
+    fun reloadCredentials(login: Boolean = false) {
+        if (login) relogin().also { return }
+
+        val indexJsUrl = client.newCall(GET(baseUrl).newBuilder().fetch(Fetch.DOCUMENT).build()).execute()
             .asJsoup()
             .selectFirst("script[src*=index]")
             ?.absUrl("src") ?: return
 
-        val js = client.newCall(GET(indexJsUrl)).execute().body.string()
+        val js = client.newCall(GET(indexJsUrl).newBuilder().fetch(Fetch.SCRIPT).build()).execute().body.string()
 
         encKeyRegex.find(js)?.groupValues?.get(1)?.let { viteApiEncKey = it }
     }
@@ -107,10 +114,7 @@ class KuroMangasDecryptor(val baseUrl: String, val client: OkHttpClient) {
 
     fun derivePassword(date: String = LocalDate.now(ZoneOffset.UTC).toString()): String {
         val toHash = "$date$HOSTNAME_PART$ANTIBOT"
-        val md5Part = MessageDigest.getInstance("MD5")
-            .digest(toHash.toByteArray())
-            .joinToString("") { "%02x".format(it) }
-            .substring(0, 8)
+        val md5Part = toHash.md5().toHexString().substring(0, 8)
         return viteApiEncKey + md5Part
     }
 

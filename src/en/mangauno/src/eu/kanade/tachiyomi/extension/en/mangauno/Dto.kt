@@ -3,12 +3,13 @@ package eu.kanade.tachiyomi.extension.en.mangauno
 import eu.kanade.tachiyomi.extension.en.mangauno.Mangauno.Companion.IMG_API_URL
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
+import keiyoushi.utils.MarkdownDescription
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.tryParse
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import org.jsoup.parser.Parser
-import java.text.SimpleDateFormat
+import kotlin.time.Instant
 
 @Serializable
 class ListResponse(
@@ -42,7 +43,7 @@ class DetailsResponse(
     private val chapters: List<ChapterDto>,
 ) {
     fun toSManga(useEnglish: Boolean) = manga.toSManga(useEnglish)
-    fun toSChapterList(dateFormat: SimpleDateFormat) = chapters.map { it.toSChapter(dateFormat, manga.slug) }
+    fun toSChapterList() = chapters.map { it.toSChapter(manga.slug) }
 }
 
 @Serializable
@@ -58,6 +59,10 @@ class MangaDetailsDto(
     private val genres: String?,
     private val tags: String?,
     private val status: String?,
+    private val type: String?,
+    @SerialName("anilist_id") private val anilistId: Long?,
+    @SerialName("mal_id") private val malId: Long?,
+    @SerialName("mangadex_id") private val mangadexId: String?,
 ) {
     fun toSManga(useEnglish: Boolean) = SManga.create().apply {
         url = slug
@@ -67,13 +72,24 @@ class MangaDetailsDto(
             this@MangaDetailsDto.japaneseTitle?.ifEmpty { null } ?: this@MangaDetailsDto.title
         }
         thumbnail_url = cover?.let { "$IMG_API_URL$it" }
-        description = synopsis
+        description = MarkdownDescription.Builder()
+            .description(synopsis)
+            .altTitles(listOfNotNull(this@MangaDetailsDto.title, englishTitle, japaneseTitle).filter { it != this.title })
+            .links(
+                listOf(
+                    "AniList" to anilistId?.let { "https://anilist.co/manga/$it" },
+                    "MyAnimeList" to malId?.let { "https://myanimelist.net/manga/$it" },
+                    "MangaDex" to mangadexId?.let { "https://mangadex.org/title/$it" },
+                ),
+            )
+            .build()
         author = this@MangaDetailsDto.author?.replace(" & ", ", ")
         artist = this@MangaDetailsDto.artist?.replace(" & ", ", ")
 
         val parsedGenres = genres?.parseAs<List<String>>() ?: emptyList()
         val parsedTags = tags?.parseAs<List<String>>() ?: emptyList()
-        genre = (parsedGenres + parsedTags).filter { it.isNotEmpty() }.joinToString()
+        val typeName = type?.replaceFirstChar { it.uppercase() }
+        genre = (listOfNotNull(typeName) + parsedGenres + parsedTags).filter { it.isNotEmpty() }.joinToString()
 
         this.status = when (this@MangaDetailsDto.status?.lowercase()) {
             "ongoing" -> SManga.ONGOING
@@ -92,27 +108,33 @@ class ChapterDto(
     private val volume: Int?,
     private val title: String?,
     private val source: String?,
+    @SerialName("source_group_name") private val sourceGroupName: String?,
     @SerialName("published_at") private val publishedAt: String?,
 ) {
-    fun toSChapter(dateFormat: SimpleDateFormat, mangaSlug: String) = SChapter.create().apply {
+    fun toSChapter(mangaSlug: String) = SChapter.create().apply {
         url = "$mangaSlug/$id"
 
         val chStr = chapterNumber?.toFloatOrNull()?.toString()?.removeSuffix(".0")?.let { "Ch. $it" }
         val volStr = volume?.let { "Vol. $it" }
-        val unescapedTitle = title?.let { Parser.unescapeEntities(it, true) }
+        val unescapedTitle = title?.let { Parser.unescapeEntities(it, true).trim() }
 
         val parts = listOfNotNull(chStr, volStr, unescapedTitle).filter { it.isNotEmpty() }
         name = parts.joinToString(" — ")
         if (name.isEmpty()) name = "Chapter"
 
-        scanlator = source
-        date_upload = dateFormat.tryParse(publishedAt)
+        scanlator = sourceGroupName ?: source
+        date_upload = Instant.tryParse(publishedAt)
     }
 }
 
 @Serializable
 class PageListResponse(
-    val pages: List<String>,
+    val chapter: PageListChapterDto,
+)
+
+@Serializable
+class PageListChapterDto(
+    @SerialName("page_count") val pageCount: Int,
 )
 
 @Serializable

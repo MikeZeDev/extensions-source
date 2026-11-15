@@ -6,16 +6,18 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
-import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
 import keiyoushi.network.addCookie
 import keiyoushi.network.get
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
+import keiyoushi.utils.asJsoup
 import keiyoushi.utils.extractNextJs
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.string
 import kotlinx.serialization.json.JsonObject
+import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Response
@@ -28,9 +30,11 @@ abstract class Aurora : KeiSource() {
     override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = rateLimit(3, 1.seconds)
         .addCookie("mnx_adulto" to "1")
 
-    override suspend fun getPopularManga(page: Int) = getMangasPage(client.get("$baseUrl/catalogo"))
+    override fun Headers.Builder.configureHeaders() = set("Alt-Used", baseUrl.substringAfterLast("/"))
 
-    override suspend fun getLatestUpdates(page: Int) = getMangasPage(client.get("$baseUrl/novidades"))
+    override suspend fun getPopularManga(page: Int) = getMangasPage(client.get("$baseUrl/catalogo", Fetch.DOCUMENT))
+
+    override suspend fun getLatestUpdates(page: Int) = getMangasPage(client.get("$baseUrl/novidades", Fetch.DOCUMENT))
 
     private fun getMangasPage(response: Response): MangasPage {
         val dto = response.extractNextJs<SeriesDto>()
@@ -54,7 +58,7 @@ abstract class Aurora : KeiSource() {
         fetchDetails: Boolean,
         fetchChapters: Boolean,
     ): SMangaUpdate {
-        val document = client.get(getMangaUrl(manga)).asJsoup()
+        val document = client.get(getMangaUrl(manga), Fetch.DOCUMENT).asJsoup()
 
         val manga = getSMangaDetails(document, manga)
         val chapters = document.extractNextJs<ChapterListDto>()
@@ -89,18 +93,27 @@ abstract class Aurora : KeiSource() {
         val pageHeaders = headersBuilder()
             .set("rsc", "1")
             .set("Referer", entryURL(chapter.memo))
-            .set("Sec-Fetch-Mode", "cors")
-            .set("Sec-Fetch-Dest", "empty")
-            .set("Sec-Fetch-Site", "same-origin")
             .set("next-url", entryURL(chapter.memo).toHttpUrl().encodedPath)
-            .set("Accept", "*/*")
             .build()
         val response = client
             .newBuilder()
             .addCookie("mnx_gate_${chapter.chapter_number}" to "1")
             .build()
-            .get(getChapterUrl(chapter), pageHeaders)
+            .get(getChapterUrl(chapter), pageHeaders, Fetch.XHR)
 
-        return response.extractNextJs<PagesDto>()?.toPageList() ?: emptyList()
+        return response.extractNextJs<PagesDto>()?.toPageList { encodedUrl ->
+            decrypt(encodedUrl, getKey(encodedUrl))
+        } ?: emptyList()
+    }
+
+    private var key: String? = null
+    suspend fun getKey(payload: String): String {
+        if (!key.isNullOrBlank()) {
+            return key!!
+        }
+        val (v, e) = getParams(payload)
+        return client.get("$baseUrl/api/atfield/key?v=$v&e=$e", Fetch.XHR).parseAs<KeyDto>().k.also {
+            key = it
+        }
     }
 }

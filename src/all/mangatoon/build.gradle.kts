@@ -6,11 +6,11 @@ plugins {
 
 keiyoushi {
     name = "MangaToon (Limited)"
-    versionCode = 8
+    versionCode = 3
     contentWarning = ContentWarning.SAFE
-    libVersion = "1.4"
+    libVersion = "1.6"
 
-    listOf("zh", "en", "id", "vi", "es", "th", "fr", "ja", "pt-BR").forEach {
+    listOf("zh", "en", "id", "vi", "es", "th", "fr", "pt-BR").forEach {
         source {
             lang = it
             baseUrl = "https://mangatoon.mobi"

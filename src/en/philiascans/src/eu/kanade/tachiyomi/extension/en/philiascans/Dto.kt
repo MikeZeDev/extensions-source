@@ -4,9 +4,8 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.utils.tryParse
 import kotlinx.serialization.Serializable
-import java.text.SimpleDateFormat
-import java.util.Locale
-import java.util.TimeZone
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import kotlin.time.Instant
 
 @Serializable
 class SeriesResponse(
@@ -26,7 +25,7 @@ class Item(
     fun toSManga(baseUrl: String) = SManga.create().apply {
         url = slug
         title = this@Item.title
-        thumbnail_url = coverImageUrl?.let { if (it.startsWith("http")) it else "$baseUrl/$it" }
+        thumbnail_url = coverImageUrl?.let { baseUrl.toHttpUrl().resolve(it)?.toString() }
     }
 }
 
@@ -58,8 +57,16 @@ class DetailsResponse(
             "completed" -> SManga.COMPLETED
             else -> SManga.UNKNOWN
         }
-        thumbnail_url = coverImageUrl?.let { if (it.startsWith("http")) it else "$baseUrl/$it" }
+        thumbnail_url = coverImageUrl?.let { baseUrl.toHttpUrl().resolve(it)?.toString() }
     }
+}
+
+@Serializable
+class Genre(
+    private val slug: String,
+    private val name: String,
+) {
+    fun toPair() = name to slug
 }
 
 @Serializable
@@ -89,18 +96,15 @@ class ChapterItem(
         val lock = if (isLocked) "🔒 " else ""
         val validTitle = title?.takeIf { it.isNotBlank() && it != "null" && it != number }
         name = lock + if (validTitle != null) "Chapter $number - $validTitle" else "Chapter $number"
-        date_upload = dateFormat.tryParse(publishedAt)
-        chapter_number = number.toFloat()
+        date_upload = Instant.tryParse(publishedAt)
+        number.toFloatOrNull()?.let { chapter_number = it }
     }
-}
-
-private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ROOT).apply {
-    timeZone = TimeZone.getTimeZone("UTC")
 }
 
 @Serializable
 class TokenResponse(
     val token: String,
+    val expiresAt: Long,
 )
 
 @Serializable

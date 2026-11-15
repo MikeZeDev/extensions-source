@@ -6,9 +6,9 @@ plugins {
 
 keiyoushi {
     name = "Niadd"
-    versionCode = 2
+    versionCode = 4
     contentWarning = ContentWarning.MIXED
-    libVersion = "1.4"
+    libVersion = "1.6"
 
     val subdomains = mapOf(
         "pt-BR" to "br",
@@ -24,5 +24,9 @@ keiyoushi {
             lang = langCode
             baseUrl = "https://$sub.niadd.com"
         }
+    }
+    deeplink {
+        path("/manga/..*\\.html")
+        path("/original/..*\\.html")
     }
 }

@@ -1,72 +1,177 @@
 package eu.kanade.tachiyomi.extension.zh.baozimanhua
 
-import android.content.SharedPreferences
-import androidx.preference.CheckBoxPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
-import com.github.stevenyomi.baozibanner.BaoziBanner
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
-import eu.kanade.tachiyomi.util.asJsoup
+import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
+import keiyoushi.network.get
 import keiyoushi.network.rateLimit
-import keiyoushi.utils.getPreferences
-import keiyoushi.utils.tryParse
+import keiyoushi.source.KeiSource
+import keiyoushi.utils.asJsoup
+import keiyoushi.utils.attrOrNull
+import keiyoushi.utils.getPreferencesLazy
+import keiyoushi.utils.parseAs
+import keiyoushi.utils.textOrNull
+import keiyoushi.utils.toJsonElement
+import keiyoushi.utils.tryParseDate
+import kotlinx.serialization.json.JsonElement
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.Response
-import rx.Observable
-import java.text.SimpleDateFormat
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Locale
+import kotlin.time.Duration.Companion.days
+import kotlin.time.Duration.Companion.hours
+import kotlin.time.Duration.Companion.minutes
 
 @Source
 abstract class Baozi :
-    HttpSource(),
+    KeiSource(),
     ConfigurableSource {
 
-    private val preferences: SharedPreferences = getPreferences()
+    private val preferences by getPreferencesLazy()
 
-    override val supportsLatest = true
+    private val isAppMirror: Boolean
+        get() = baseUrl.toHttpUrl().host.startsWith("app")
 
-    private val bannerInterceptor = BaoziBanner(
-        level = preferences.getString(BaoziBanner.PREF, DEFAULT_LEVEL)!!.toInt(),
+    private val siteBaseUrl: String
+        get() = if (isAppMirror) "$baseUrl/baozimhapp" else baseUrl
+
+    private val appBaseUrl: String
+        get() = if (isAppMirror) baseUrl else APP_BASE_URL
+
+    private val bannerInterceptor = BaoziBannerInterceptor(
+        level = preferences.getString(BaoziBannerInterceptor.PREF, DEFAULT_LEVEL)!!.toInt(),
     )
 
-    override val client by lazy {
-        network.client.newBuilder()
-            .addInterceptor(bannerInterceptor)
-            .addNetworkInterceptor(MissingImageInterceptor)
-            .addNetworkInterceptor(RedirectDomainInterceptor(baseUrl.toHttpUrl().host))
-            .rateLimit(2)
-            .build()
+    override fun OkHttpClient.Builder.configureClient() = apply {
+        addInterceptor(bannerInterceptor)
+        addInterceptor(GatekeeperInterceptor)
+        addInterceptor(ImageFallbackInterceptor)
+        addNetworkInterceptor(MissingImageInterceptor)
+        rateLimit(2)
     }
 
-    override fun headersBuilder() = super.headersBuilder()
-        .add("Referer", "$baseUrl/")
+    override suspend fun getPopularManga(page: Int): MangasPage {
+        val url = siteBaseUrl.toHttpUrl().newBuilder()
+            .addPathSegment("classify")
+            .addQueryParameter("page", page.toString())
+            .build()
+        val mangas = parseMangaCards(client.get(url, Fetch.DOCUMENT).asJsoup())
+        return MangasPage(mangas, mangas.size >= 36)
+    }
 
-    override fun chapterListParse(response: Response): List<SChapter> {
-        val document = response.asJsoup()
-        val fullListTitle = document.selectFirst(".section-title:containsOwn(章节目录), .section-title:containsOwn(章節目錄)")
-        val chapterElements = if (fullListTitle == null) { // only latest chapters
-            document.select(".comics-chapters")
-        } else {
-            // chapters are listed oldest to newest in the source
-            fullListTitle.parent()?.select(".comics-chapters")?.reversed() ?: emptyList()
-        }
+    override suspend fun getLatestUpdates(page: Int): MangasPage = if (isAppMirror) {
+        getPopularManga(page)
+    } else {
+        val url = baseUrl.toHttpUrl().newBuilder().addPathSegments("list/new").build()
+        MangasPage(parseMangaCards(client.get(url, Fetch.DOCUMENT).asJsoup()), false)
+    }
 
-        return chapterElements.map { element ->
-            SChapter.create().apply {
-                setUrlWithoutDomain(element.selectFirst("a")?.attr("abs:href").orEmpty())
-                name = element.text()
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
+        val url = siteBaseUrl.toHttpUrl().newBuilder().apply {
+            if (query.isNotEmpty()) {
+                addPathSegment("search")
+                addQueryParameter("q", query)
+            } else {
+                addPathSegment("classify")
+                addQueryParameter("page", page.toString())
+                filters.filterIsInstance<UriPartFilter>().forEach { addQueryParameter(it.param, it.value) }
             }
-        }.apply {
+        }.build()
+
+        val mangas = parseMangaCards(client.get(url, Fetch.DOCUMENT).asJsoup())
+        return MangasPage(mangas, query.isEmpty() && mangas.size >= 36)
+    }
+
+    private fun parseMangaCards(document: Document): List<SManga> = document.select("div.comics-card")
+        .mapNotNull(::mangaFromElement)
+
+    private fun mangaFromElement(element: Element): SManga? {
+        val title = element.selectFirst(".comics-card__title")?.text()
+            // Card template the site fills in client-side
+            ?.takeUnless { it.isEmpty() || it.contains("{{") }
+            ?: return null
+        val poster = element.selectFirst(".comics-card__poster") ?: return null
+        val href = poster.attr("href").takeIf(String::isNotEmpty)
+            // App mirror: onclick="send_app_msg('call_page', ['comic', 'slug'])"
+            ?: COMIC_ONCLICK_REGEX.find(poster.attr("onclick"))?.let { "/comic/" + it.groupValues[1] }
+            ?: return null
+
+        return SManga.create().apply {
+            url = normalizeRelativeUrl(href)
+            this.title = title
+            thumbnail_url = element.selectFirst("amp-img, img")?.let { img ->
+                listOf("data-src", "src").firstOrNull { img.attrOrNull(it) != null }?.let(img::absUrl)
+            }?.let(::coverUrl)
+        }
+    }
+
+    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
+        if (DOMAINS.none { url.host == it || url.host.endsWith(".$it") }) return null
+
+        val comicIndex = url.pathSegments.indexOf("comic")
+        if (comicIndex == -1) return null
+
+        val id = if (url.pathSegments.getOrNull(comicIndex + 1) == "chapter") {
+            url.pathSegments.getOrNull(comicIndex + 2)
+        } else {
+            url.pathSegments.getOrNull(comicIndex + 1)
+        } ?: return null
+
+        val manga = SManga.create().apply { this.url = "/comic/$id" }
+        return getMangaUpdate(manga, emptyList(), fetchDetails = true, fetchChapters = false).manga
+    }
+
+    override fun getMangaUrl(manga: SManga): String = siteBaseUrl + manga.url
+
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
+        val document = client.get(getMangaUrl(manga), Fetch.DOCUMENT).asJsoup()
+        return SMangaUpdate(
+            manga = mangaDetailsParse(document).apply { url = manga.url },
+            chapters = chapterListParse(document),
+        )
+    }
+
+    private fun mangaDetailsParse(document: Document): SManga = SManga.create().apply {
+        title = document.selectFirst("h1.comics-detail__title")!!.text()
+        thumbnail_url = document.selectFirst("meta[name=og:image]")?.attrOrNull("content")?.let(::coverUrl)
+        author = document.selectFirst("h2.comics-detail__author")?.textOrNull()?.split(',')?.joinToString()
+        description = document.selectFirst("p.comics-detail__desc")?.textOrNull()
+        // Status first, then region and genres
+        val tags = document.select("div.tag-list > span.tag").map { it.text() }
+        status = when (tags.firstOrNull()) {
+            "连载中", "連載中" -> SManga.ONGOING
+            "已完结", "已完結" -> SManga.COMPLETED
+            else -> SManga.UNKNOWN
+        }
+        genre = tags.drop(1).joinToString().ifEmpty { null }
+    }
+
+    private fun chapterListParse(document: Document): List<SChapter> {
+        // Series without a full chapter list only have the latest chapters block
+        val chapterElements = document.select("#chapter-items .comics-chapters, #chapters_other_list .comics-chapters")
+            .reversed()
+            .ifEmpty { document.select(".comics-chapters") }
+
+        return chapterElements.mapNotNull(::chapterFromElement).apply {
             val chapterOrderPref = preferences.getString(CHAPTER_ORDER_PREF, CHAPTER_ORDER_DISABLED)
             if (chapterOrderPref != CHAPTER_ORDER_DISABLED) {
                 val isAggressive = chapterOrderPref == CHAPTER_ORDER_AGGRESSIVE
@@ -76,171 +181,118 @@ abstract class Baozi :
                     }
                 }
             }
-            if (isNotEmpty()) {
-                val date = document.selectFirst("em")?.text().orEmpty()
-                if (date.contains('年')) {
-                    this[0].date_upload = DATE_FORMAT.tryParse(date.removePrefix("(").removeSuffix(" 更新)"))
-                }
+
+            val date = document.selectFirst(".comics-detail em")?.text()?.removePrefix("(")?.removeSuffix(" 更新)")
+            if (date != null) {
+                firstOrNull()?.date_upload = parseUpdateDate(date)
             }
         }
     }
 
-    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/classify?page=$page", headers)
-
-    override fun popularMangaParse(response: Response): MangasPage {
-        val document = response.asJsoup()
-        val mangas = document.select("div.pure-g div a.comics-card__poster").map { element ->
-            SManga.create().apply {
-                setUrlWithoutDomain(element.attr("abs:href"))
-                title = element.attr("title").trim()
-                thumbnail_url = element.selectFirst("> amp-img")?.attr("abs:src")
-            }
-        }
-        return MangasPage(mangas, mangas.size == 36)
-    }
-
-    override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/list/new", headers)
-
-    override fun latestUpdatesParse(response: Response): MangasPage {
-        val document = response.asJsoup()
-        val mangas = document.select("div.pure-g div a.comics-card__poster").map { element ->
-            SManga.create().apply {
-                setUrlWithoutDomain(element.attr("abs:href"))
-                title = element.attr("title").trim()
-                thumbnail_url = element.selectFirst("> amp-img")?.attr("abs:src")
-            }
-        }
-        return MangasPage(mangas, false)
-    }
-
-    override fun mangaDetailsParse(response: Response): SManga {
-        val document = response.asJsoup()
-        return SManga.create().apply {
-            title = document.selectFirst("h1.comics-detail__title")?.text().orEmpty()
-            thumbnail_url = document.selectFirst("div.pure-g div > amp-img")?.attr("abs:src")
-            author = document.selectFirst("h2.comics-detail__author")?.text().orEmpty()
-            description = document.selectFirst("p.comics-detail__desc")?.text().orEmpty()
-            status = when (document.selectFirst("div.tag-list > span.tag")?.text()) {
-                "连载中", "連載中" -> SManga.ONGOING
-                "已完结", "已完結" -> SManga.COMPLETED
-                else -> SManga.UNKNOWN
-            }
-        }
-    }
-
-    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> = Observable.fromCallable {
-        val urls = mutableListOf<String>()
-
-        var chapterUrl = baseUrl + chapter.url
-        if (preferences.getBoolean(QUICK_PAGES_PREF, true)) {
-            chapterUrl = quickPageUrl(chapterUrl)
-        }
-
-        var request = GET(chapterUrl, headers).newBuilder().build()
-        while (true) {
-            val document = client.newCall(request).execute().use { it.asJsoup() }
-            urls.addAll(document.select(".comic-contain amp-img").map { it.attr("abs:src") })
-
-            val url = document.selectFirst("#next-chapter")
-                ?.takeIf {
-                    val text = it.text()
-                    text == "下一页" || text == "下一頁"
-                }
-                ?.attr("abs:href")
-                ?: break
-
-            request = GET(url, headers)
-        }
-        urls.mapIndexed { index, imageUrl -> Page(index, imageUrl = imageUrl) }
-    }
-
-    private fun quickPageUrl(url: String): String = baseUrl.toHttpUrl().newBuilder().apply {
-        val chapUrl = url.toHttpUrl()
-        addPathSegments("comic/chapter")
-        chapUrl.queryParameter("comic_id")?.let { addPathSegment(it) }
-        addPathSegment("${chapUrl.queryParameter("section_slot")}_${chapUrl.queryParameter("chapter_slot")}.html")
-    }.build().toString()
-
-    override fun imageRequest(page: Page): Request {
-        val url = page.imageUrl!!.replace(".baozicdn.com", ".baozimh.com")
-        return GET(url, headers)
-    }
-
-    override fun pageListParse(response: Response) = throw UnsupportedOperationException()
-
-    override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
-
-    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
-        if (query.startsWith("https://")) {
-            val url = query.toHttpUrl()
-            if (url.host !in MIRRORS) {
-                throw Exception("Unsupported url")
-            }
-            val id = if (url.pathSegments[1] == "chapter") {
-                url.pathSegments[2]
-            } else {
-                url.pathSegments[1]
-            }
-            return fetchSearchManga(page, "$ID_SEARCH_PREFIX$id", filters)
-        }
-        return if (query.startsWith(ID_SEARCH_PREFIX)) {
-            val id = query.removePrefix(ID_SEARCH_PREFIX)
-            client.newCall(searchMangaByIdRequest(id))
-                .asObservableSuccess()
-                .map { response -> searchMangaByIdParse(response, id) }
+    private fun chapterFromElement(element: Element): SChapter? {
+        val href = element.selectFirst("a[href]")?.attr("href")
+        val url = if (href != null) {
+            normalizeRelativeUrl(href)
         } else {
-            super.fetchSearchManga(page, query, filters)
+            // App mirror: onclick="send_app_msg('call_page', ['chapter', 'slug', section, chapter])"
+            val match = CHAPTER_ONCLICK_REGEX.find(element.selectFirst("[onclick]")?.attr("onclick") ?: return null)
+                ?: return null
+            val (slug, section, chapter) = match.destructured
+            normalizeRelativeUrl("/comic/chapter/$slug/${section}_$chapter.html")
+        }
+
+        return SChapter.create().apply {
+            this.url = url
+            name = element.text()
         }
     }
 
-    private fun searchMangaByIdRequest(id: String) = GET("$baseUrl/comic/$id", headers)
+    // Web mirrors now serve an app-download wall with placeholder images instead of the chapter;
+    // only the app reader still has the real pages
+    override suspend fun getPageList(chapter: SChapter): List<Page> = client.get(appChapterUrl(chapter.url), Fetch.DOCUMENT).asJsoup()
+        .select(".comic-contain img[data-src]")
+        .mapIndexed { index, img -> Page(index, imageUrl = img.absUrl("data-src")) }
 
-    private fun searchMangaByIdParse(response: Response, id: String): MangasPage {
-        val sManga = mangaDetailsParse(response)
-        sManga.url = "/comic/$id"
-        return MangasPage(listOf(sManga), false)
-    }
+    override fun getChapterUrl(chapter: SChapter): String = appChapterUrl(chapter.url)
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = if (query.isNotEmpty()) {
-        val requestBaseUrl = baseUrl.replace(".dinnerku.com", ".baozimh.com")
-        val url = requestBaseUrl.toHttpUrl().newBuilder()
-            .addEncodedPathSegment("search")
-            .addQueryParameter("q", query)
+    private fun appChapterUrl(chapterUrl: String): String {
+        val url = baseUrl.toHttpUrl().resolve(chapterUrl)!!
+        val comicId = url.queryParameter("comic_id")
+        val (id, slot) = if (comicId != null) {
+            comicId to "${url.queryParameter("section_slot")}_${url.queryParameter("chapter_slot")}.html"
+        } else {
+            val segments = url.pathSegments
+            val index = segments.indexOf("chapter")
+            segments[index + 1] to segments[index + 2]
+        }
+        return appBaseUrl.toHttpUrl().newBuilder()
+            .addPathSegments("baozimhapp/comic/chapter")
+            .addPathSegment(id)
+            .addPathSegment(slot)
             .toString()
-        GET(url, headers)
-    } else {
-        val parts = filters.filterIsInstance<UriPartFilter>().joinToString("&") { it.toUriPart() }
-        GET("$baseUrl/classify?page=$page&$parts", headers)
     }
 
-    override fun searchMangaParse(response: Response): MangasPage {
-        val document = response.asJsoup()
-        val mangas = document.select("div.pure-g div a.comics-card__poster").map { element ->
-            SManga.create().apply {
-                setUrlWithoutDomain(element.attr("abs:href"))
-                title = element.attr("title").trim()
-                thumbnail_url = element.selectFirst("> amp-img")?.attr("abs:src")
+    // baozicdn.com geo-redirects to regional nodes that are sometimes unreachable, baozimh.com serves directly
+    override fun getImageRequest(page: Page): Request {
+        val url = page.imageUrl!!.toHttpUrl()
+        val host = url.host.replace(".baozicdn.com", ".baozimh.com")
+        return GET(url.newBuilder().host(host).build(), headers).newBuilder()
+            .tag(BaoziBannerInterceptor.ReaderPageImageTag::class.java, BaoziBannerInterceptor.ReaderPageImageTag)
+            .build()
+    }
+
+    override val supportsFilterFetching = true
+
+    override suspend fun fetchFilterData(): JsonElement = client.get(appBaseUrl.toHttpUrl().newBuilder().addPathSegments("baozimhapp/classify").build(), Fetch.DOCUMENT).asJsoup()
+        .select(".classify-nav")
+        .mapNotNull { nav ->
+            val options = nav.select("[onclick]").mapNotNull { item ->
+                FILTER_ONCLICK_REGEX.find(item.attr("onclick"))?.let { it to item.text() }
             }
+            FilterGroup(
+                param = options.firstOrNull()?.first?.groupValues?.get(1) ?: return@mapNotNull null,
+                options = options.map { (match, name) -> FilterOption(name, match.groupValues[2]) },
+            )
         }
-        val isSearch = response.request.url.encodedPath.contains("search")
-        return MangasPage(mangas, !isSearch && mangas.size == 36)
+        .toJsonElement()
+
+    override fun getFilterList(data: JsonElement?) = getFilters(data?.parseAs<List<FilterGroup>>())
+
+    private fun parseUpdateDate(date: String): Long {
+        val relative = RELATIVE_DATE_REGEX.matchEntire(date) ?: return DATE_FORMAT.tryParseDate(date, SITE_ZONE)
+        val amount = relative.groupValues[1].toLong()
+        val duration = when (relative.groupValues[2]) {
+            "分钟", "分鐘" -> amount.minutes
+            "小时", "小時" -> amount.hours
+            else -> amount.days
+        }
+        return System.currentTimeMillis() - duration.inWholeMilliseconds
     }
 
-    override fun getFilterList() = getFilters()
+    // Covers from other sites come wrapped in the site's resizer, which answers 500 for them
+    private fun coverUrl(url: String): String = NESTED_COVER_REGEX.find(url)?.groupValues?.get(1) ?: url
+
+    private fun normalizeRelativeUrl(url: String): String {
+        val resolvedUrl = baseUrl.toHttpUrl().resolve(url) ?: return url
+        return buildString {
+            append(resolvedUrl.encodedPath.removePrefix("/baozimhapp"))
+            resolvedUrl.encodedQuery?.let { append('?').append(it) }
+        }
+    }
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         ListPreference(screen.context).apply {
-            key = BaoziBanner.PREF
-            title = BaoziBanner.PREF_TITLE
-            summary = BaoziBanner.PREF_SUMMARY
-            entries = BaoziBanner.PREF_ENTRIES
-            entryValues = BaoziBanner.PREF_VALUES
+            key = BaoziBannerInterceptor.PREF
+            title = BaoziBannerInterceptor.PREF_TITLE
+            summary = BaoziBannerInterceptor.PREF_SUMMARY
+            entries = BaoziBannerInterceptor.PREF_ENTRIES
+            entryValues = BaoziBannerInterceptor.PREF_VALUES
             setDefaultValue(DEFAULT_LEVEL)
             setOnPreferenceChangeListener { _, newValue ->
                 bannerInterceptor.level = (newValue as String).toInt()
                 true
             }
-        }.let { screen.addPreference(it) }
+        }.let(screen::addPreference)
 
         ListPreference(screen.context).apply {
             key = CHAPTER_ORDER_PREF
@@ -252,46 +304,29 @@ abstract class Baozi :
             entries = arrayOf("关闭", "开启 (对有标号的章节有效)", "强力模式 (对所有章节有效)")
             entryValues = arrayOf(CHAPTER_ORDER_DISABLED, CHAPTER_ORDER_ENABLED, CHAPTER_ORDER_AGGRESSIVE)
             setDefaultValue(CHAPTER_ORDER_DISABLED)
-        }.let { screen.addPreference(it) }
-
-        CheckBoxPreference(screen.context).apply {
-            key = QUICK_PAGES_PREF
-            title = "Quick Pages/快速页面"
-            summary = "跳过页面上的重定向。五月休息。(对不起，必须使用翻译器)"
-            setDefaultValue(true)
-        }.let { screen.addPreference(it) }
+        }.let(screen::addPreference)
     }
 
     companion object {
-        const val ID_SEARCH_PREFIX = "id:"
+        // Same as the deeplink hosts
+        private val DOMAINS = setOf("baozimh.com", "webmota.com", "kukuc.co", "twmanga.com", "dinnerku.com")
 
-        private val MIRRORS get() = arrayOf(
-            "cn.baozimh.com",
-            "tw.baozimh.com",
-            "www.baozimh.com",
-            "cn.webmota.com",
-            "tw.webmota.com",
-            "www.webmota.com",
-            "cn.kukuc.co",
-            "tw.kukuc.co",
-            "www.kukuc.co",
-            "cn.twmanga.com",
-            "tw.twmanga.com",
-            "www.twmanga.com",
-            "cn.dinnerku.com",
-            "tw.dinnerku.com",
-            "www.dinnerku.com",
-        )
+        private const val APP_BASE_URL = "https://appcn.baozimh.com"
 
-        private const val DEFAULT_LEVEL = BaoziBanner.NORMAL.toString()
+        private val COMIC_ONCLICK_REGEX = Regex("""\['comic',\s*'([^']+)'""")
+        private val CHAPTER_ONCLICK_REGEX = Regex("""send_app_msg\('call_page',\s*\['chapter',\s*'([^']+)',\s*(\d+),\s*(\d+)\]\)""")
+        private val NESTED_COVER_REGEX = Regex("""/cover/(https?://[^?]+)""")
+        private val FILTER_ONCLICK_REGEX = Regex("""handle_change_filters\(this, '(\w+)', '([^']*)'\)""")
+
+        private const val DEFAULT_LEVEL = BaoziBannerInterceptor.NORMAL.toString()
 
         private const val CHAPTER_ORDER_PREF = "CHAPTER_ORDER"
         private const val CHAPTER_ORDER_DISABLED = "0"
         private const val CHAPTER_ORDER_ENABLED = "1"
         private const val CHAPTER_ORDER_AGGRESSIVE = "2"
 
-        private val DATE_FORMAT by lazy { SimpleDateFormat("yyyy年MM月dd日", Locale.ENGLISH) }
-
-        private const val QUICK_PAGES_PREF = "QUICK_PAGES"
+        private val RELATIVE_DATE_REGEX = Regex("""(\d+)(分钟|分鐘|小时|小時|天)前""")
+        private val SITE_ZONE = ZoneId.of("Asia/Shanghai")
+        private val DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy年MM月dd日", Locale.ROOT)
     }
 }

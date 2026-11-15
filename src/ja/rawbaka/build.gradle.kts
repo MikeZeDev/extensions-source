@@ -6,13 +6,16 @@ plugins {
 
 keiyoushi {
     name = "RawBaka"
-    versionCode = 0
+    versionCode = 57
     contentWarning = ContentWarning.MIXED
-    libVersion = "1.4"
-    theme = "madara"
+    libVersion = "1.6"
 
     source {
         lang = "ja"
-        baseUrl = "https://rawbaka.com"
+        baseUrl = "https://rawbaka.site"
+    }
+
+    deeplink {
+        path("/manga/..*")
     }
 }

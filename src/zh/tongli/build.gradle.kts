@@ -8,11 +8,15 @@ keiyoushi {
     name = "Tongli"
     versionCode = 1
     contentWarning = ContentWarning.MIXED
-    libVersion = "1.4"
+    libVersion = "1.6"
 
     source {
         name = "東立"
         lang = "zh"
         baseUrl = "https://ebook.tongli.com.tw"
+    }
+
+    deeplink {
+        path("/book")
     }
 }

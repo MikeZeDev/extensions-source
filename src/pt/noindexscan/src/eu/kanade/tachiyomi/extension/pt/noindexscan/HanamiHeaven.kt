@@ -1,106 +1,113 @@
 package eu.kanade.tachiyomi.extension.pt.noindexscan
 
-import android.annotation.SuppressLint
-import eu.kanade.tachiyomi.multisrc.madara.Madara
-import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.POST
+import eu.kanade.tachiyomi.multisrc.madara.GenreRoute
+import eu.kanade.tachiyomi.multisrc.madara.MadaraNoAjax
+import eu.kanade.tachiyomi.source.model.FilterList
+import eu.kanade.tachiyomi.source.model.MangasPage
+import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
+import keiyoushi.network.get
 import keiyoushi.network.rateLimit
-import okhttp3.FormBody
-import okhttp3.Interceptor
+import keiyoushi.utils.asJsoup
+import keiyoushi.utils.parseAs
+import keiyoushi.utils.toJsonElement
+import keiyoushi.utils.tryParse
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
-import okhttp3.Response
-import java.io.IOException
-import java.security.MessageDigest
-import java.security.SecureRandom
-import java.security.cert.X509Certificate
-import java.text.SimpleDateFormat
-import java.util.Locale
-import javax.net.ssl.SSLContext
-import javax.net.ssl.TrustManager
-import javax.net.ssl.X509TrustManager
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.Instant
 
 @Source
-abstract class HanamiHeaven : Madara() {
-    override val dateFormat = SimpleDateFormat("dd/MM/yyyy", Locale.ROOT)
+abstract class HanamiHeaven : MadaraNoAjax() {
+    override fun OkHttpClient.Builder.configureClient() = rateLimit(3, 2.seconds)
 
-    private fun OkHttpClient.Builder.ignoreAllSSLErrors(): OkHttpClient.Builder {
-        val naiveTrustManager =
-            @SuppressLint("CustomX509TrustManager")
-            object : X509TrustManager {
-                override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
-                override fun checkClientTrusted(certs: Array<X509Certificate>, authType: String) = Unit
-                override fun checkServerTrusted(certs: Array<X509Certificate>, authType: String) = Unit
-            }
+    override val mangaSubString = "todas-as-obras"
+    override val orderQueryParameter = "ordem"
+    override val searchQueryParameter = "busca"
+    override fun nextPageSelector() = ".mch-catalogue__pages a.next"
 
-        val insecureSocketFactory = SSLContext.getInstance("TLSv1.2").apply {
-            val trustAllCerts = arrayOf<TrustManager>(naiveTrustManager)
-            init(null, trustAllCerts, SecureRandom())
-        }.socketFactory
-
-        sslSocketFactory(insecureSocketFactory, naiveTrustManager)
-        hostnameVerifier { _, _ -> true }
-        return this
+    override fun archiveUrlBuilder(page: Int, order: String, path: String, query: String) = super.archiveUrlBuilder(1, order, path, query).apply {
+        if (page > 1) addQueryParameter("pagina", page.toString())
     }
 
-    override val client: OkHttpClient = super.client.newBuilder()
-        .ignoreAllSSLErrors() // Bypass the "Chain validation failed" issue
-        .addInterceptor(::jsChallengeInterceptor)
-        .rateLimit(3, 2.seconds)
-        .build()
+    override val completedStatus = super.completedStatus + "completa"
+    override val hiatusStatus = super.hiatusStatus + "em espera"
+    override val cancelledStatus = super.cancelledStatus + "cancelada"
 
-    override val useNewChapterEndpoint = true
+    // Novels have text chapters, which the reader cannot show
+    override fun archiveSelector() = "li.mch-catalogue-card:not(:has(.mch-catalogue-card__meta span:contains(Novel)))"
+    override val archiveUrlSelector = ".mch-catalogue-card__title a"
+    override fun Element.postId() = attr("data-work-id")
 
-    override val mangaDetailsSelectorTitle = "div[class*='post-title'] h1"
-    override val mangaDetailsSelectorStatus = "div.summary-heading:has(h5:contains(Status)) + div.summary-content"
+    override val mangaDetailsSelectorTitle = "#mch-work-title"
+    override val mangaDetailsSelectorAuthor = metadataSelector("Autor", "a")
+    override val mangaDetailsSelectorArtist = metadataSelector("Artista", "a")
+    override val mangaDetailsSelectorStatus = ".mch-work__status"
+    override val mangaDetailsSelectorDescription = "#mch-work-synopsis"
+    override val mangaDetailsSelectorThumbnail = ".mch-work__cover img"
+    override val mangaDetailsSelectorGenre = metadataSelector("Gêneros", "a")
+    override val mangaDetailsSelectorTag = metadataSelector("Tags", "a")
+    override val seriesTypeSelector = metadataSelector("Tipo", "dd")
+    override val altNameSelector = metadataSelector("Nome alternativo", "dd")
 
-    // Linked to src/en/yakshascans
-    private fun jsChallengeInterceptor(chain: Interceptor.Chain): Response {
-        val response = chain.proceed(chain.request())
-        if (response.code != 403) {
-            return response
+    override fun getHomeUrl() = "$baseUrl/$mangaSubString/"
+
+    override suspend fun getPopularManga(page: Int) = archivePage(page, "rating")
+
+    override suspend fun getLatestUpdates(page: Int) = archivePage(page, "")
+
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
+        val url = getHomeUrl().toHttpUrl().newBuilder().apply {
+            filters.filterIsInstance<UrlFilter>().forEach { it.addTo(this) }
+        }.build()
+        return archivePage(page, "", url.toString(), query)
+    }
+
+    // Chapter pages have no post id
+    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
+        val segments = url.pathSegments
+        val isChapter = segments.size > 2 && segments[0] == "manga"
+        return super.getMangaByUrl(if (isChapter) url.newBuilder().encodedPath("/manga/${segments[1]}/").build() else url)
+    }
+
+    // Genre links carry the slug in ?genero=
+    override fun parseDetails(document: Document, id: String, preserveUrl: String?): SManga = super.parseDetails(document, id, preserveUrl).apply {
+        val genres = document.select(mangaDetailsSelectorGenre).mapNotNull { link ->
+            link.attr("abs:href").toHttpUrl().queryParameter("genero")?.let { GenreRoute(link.text(), it, "/$mangaSubString/?genero[]=$it") }
         }
-        response.close()
-
-        Thread.sleep(3000L)
-        val token = fetchToken(chain).sha256()
-        val body = FormBody.Builder()
-            .add("challenge", token)
-            .build()
-
-        chain.proceed(POST("$baseUrl/hcdn-cgi/jschallenge-validate", headers, body))
-            .apply(Response::close)
-            .run {
-                if (!isSuccessful) {
-                    throw IOException("Falha ao bypassar o desafio JS!")
-                }
-            }
-        return chain.proceed(chain.request())
+        memo = JsonObject(memo + ("genres" to genres.toJsonElement()))
     }
 
-    private tailrec fun fetchToken(chain: Interceptor.Chain, attempt: Int = 0): String {
-        if (attempt > MAX_ATTEMPT) {
-            throw IOException("Falha ao buscar o token do desafio JS!")
-        }
-
-        val response = chain.proceed(GET("$baseUrl/hcdn-cgi/jschallenge", headers))
-        val token = TOKEN_REGEX.find(response.body.string())?.groups?.get(1)?.value
-
-        return if (token != null && token != "nil") {
-            token
-        } else {
-            fetchToken(chain, attempt + 1)
-        }
+    override fun chapterFromElement(element: Element, mangaPath: String) = super.chapterFromElement(element, mangaPath)?.apply {
+        date_upload = Instant.tryParse(element.selectFirst("time")?.attr("datetime"))
     }
 
-    private fun String.sha256(): String = MessageDigest
-        .getInstance("SHA-256")
-        .digest(toByteArray())
-        .fold("", { str, it -> str + "%02x".format(it) })
-
-    companion object {
-        private const val MAX_ATTEMPT = 5
-        private val TOKEN_REGEX = """cjs[^']+'([^']+)""".toRegex()
+    override suspend fun fetchFilterData(): JsonElement {
+        val document = client.get(getHomeUrl(), Fetch.DOCUMENT).asJsoup()
+        return document.select("input[name=genero[]]").map {
+            GenreRoute(it.parent()!!.text(), it.attr("value"), "")
+        }.toJsonElement()
     }
+
+    override fun getFilterList(data: JsonElement?): FilterList {
+        val genres = data?.parseAs<List<GenreRoute>>().orEmpty()
+        return FilterList(
+            buildList {
+                add(SelectFilter("Ordenar por", "ordem", SORT_OPTIONS))
+                add(SelectFilter("Tipo", "tipo", TYPE_OPTIONS))
+                add(SelectFilter("Status", "status", STATUS_OPTIONS))
+                add(SelectFilter("Quantidade de capítulos", "capitulos", CHAPTER_COUNT_OPTIONS))
+                add(YearFilter("Ano de lançamento"))
+                if (genres.isNotEmpty()) add(GenreFilter("Gêneros", genres))
+            },
+        )
+    }
+
+    private fun metadataSelector(label: String, value: String) = ".mch-work__metadata div:has(> dt:contains($label)) $value"
 }

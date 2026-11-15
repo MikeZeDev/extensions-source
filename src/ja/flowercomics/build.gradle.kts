@@ -6,9 +6,9 @@ plugins {
 
 keiyoushi {
     name = "Flower Comics"
-    versionCode = 2
+    versionCode = 4
     contentWarning = ContentWarning.SAFE
-    libVersion = "1.4"
+    libVersion = "1.6"
 
     source {
         lang = "ja"

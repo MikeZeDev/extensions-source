@@ -1,89 +1,64 @@
 package eu.kanade.tachiyomi.extension.es.yupmanga
 
 import app.cash.quickjs.QuickJs
-import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
-import eu.kanade.tachiyomi.util.asJsoup
+import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
+import keiyoushi.network.get
+import keiyoushi.network.post
 import keiyoushi.network.rateLimit
+import keiyoushi.source.KeiSource
+import keiyoushi.utils.asJsoup
 import keiyoushi.utils.parseAs
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.serialization.json.addJsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
+import kotlinx.serialization.json.putJsonObject
 import okhttp3.FormBody
+import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
-import okhttp3.Interceptor
-import okhttp3.Request
-import okhttp3.Response
+import okhttp3.MultipartBody
+import okhttp3.OkHttpClient
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
 
 @Source
-abstract class Yupmanga : HttpSource() {
+abstract class Yupmanga : KeiSource() {
 
-    override val supportsLatest = true
+    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = rateLimit(1)
 
-    // Cached CSRF token populated by the token interceptor during normal browsing flow.
-    private var csrfToken: String = ""
-
-    // Peeks at every HTML response to extract the token values without consuming the body.
-    private val tokenInterceptor = Interceptor { chain ->
-        val response = chain.proceed(chain.request())
-        if (response.header("Content-Type").orEmpty().contains("text/html")) {
-            // Peak a max of 3MB of data to prevent OutOfMemoryError
-            val html = response.peekBody(3 * 1024 * 1024L).string()
-
-            val token = TOKEN_REGEX.find(html)?.groupValues?.get(1)
-                ?: TOKEN_META_REGEX.find(html)?.groupValues?.get(1)?.takeIf { it.isNotBlank() }
-                ?: TOKEN_JS_REGEX.decodeChars(html).takeIf { it.isNotBlank() }
-
-            if (!token.isNullOrEmpty()) {
-                csrfToken = token
-            }
-        }
-        response
-    }
-
-    override val client = network.client.newBuilder()
-        .addInterceptor(tokenInterceptor)
-        .rateLimit(1)
-        .build()
-
-    override fun headersBuilder() = super.headersBuilder()
-        .add("Referer", "$baseUrl/")
-
-    private val apiHeaders by lazy {
-        headersBuilder()
+    private val apiHeaders: Headers
+        get() = headers.newBuilder()
             .add("X-Requested-With", "XMLHttpRequest")
             .build()
-    }
 
-    override fun popularMangaRequest(page: Int) = GET("$baseUrl/top", headers)
+    override suspend fun getPopularManga(page: Int): MangasPage = parseSeriesList(client.get("$baseUrl/top", Fetch.DOCUMENT).asJsoup())
 
-    override fun popularMangaParse(response: Response) = parseSeriesList(response.asJsoup())
+    override suspend fun getLatestUpdates(page: Int): MangasPage = parseSeriesList(client.get("$baseUrl/?page=$page", Fetch.DOCUMENT).asJsoup())
 
-    override fun latestUpdatesRequest(page: Int) = GET("$baseUrl/?page=$page", headers)
-
-    override fun latestUpdatesParse(response: Response) = parseSeriesList(response.asJsoup())
-
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
         if (query.length < 3) {
             throw Exception("El término de búsqueda debe tener al menos 3 caracteres.")
         }
         val url = "$baseUrl/search.php".toHttpUrl().newBuilder()
             .addQueryParameter("q", query)
             .addQueryParameter("page", page.toString())
+            .build()
 
-        return GET(url.build(), headers)
-    }
-
-    override fun searchMangaParse(response: Response): MangasPage {
-        val document = response.asJsoup()
+        val document = client.get(url, Fetch.DOCUMENT).asJsoup()
         document.selectFirst("main > div.container > div[class^=bg-red]:has(p)")?.let {
             throw Exception("Límite de solicitudes alcanzado. Intente de nuevo en unos minutos.")
         }
@@ -108,11 +83,23 @@ abstract class Yupmanga : HttpSource() {
         return MangasPage(mangas, hasNextPage)
     }
 
-    override fun mangaDetailsRequest(manga: SManga) = GET("$baseUrl/series.php?id=${manga.url}", headers)
+    override fun getMangaUrl(manga: SManga): String = "$baseUrl/series.php?id=${manga.url}"
 
-    override fun mangaDetailsParse(response: Response): SManga {
-        val document = response.asJsoup()
-        return SManga.create().apply {
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate = coroutineScope {
+        val details = if (fetchDetails) async { fetchMangaDetails(manga) } else null
+        val chapterList = if (fetchChapters) async { fetchChapterList(manga.url) } else null
+
+        SMangaUpdate(details?.await() ?: manga, chapterList?.await() ?: chapters)
+    }
+
+    private suspend fun fetchMangaDetails(manga: SManga): SManga {
+        val document = client.get(getMangaUrl(manga), Fetch.DOCUMENT).asJsoup()
+        return manga.apply {
             val container = document.selectFirst("main > div.container")
                 ?: throw Exception("No se pudo encontrar la información del manga")
 
@@ -136,32 +123,18 @@ abstract class Yupmanga : HttpSource() {
         else -> SManga.UNKNOWN
     }
 
-    private fun paginatedChapterListRequest(mangaId: String, page: Int): Request {
-        val url = "$baseUrl/ajax/load_chapters.php".toHttpUrl().newBuilder()
-            .addQueryParameter("series_id", mangaId)
-            .addQueryParameter("page", page.toString())
-            .addQueryParameter("order", "newest_first")
-
-        return GET(url.build(), apiHeaders)
-    }
-
-    override fun chapterListRequest(manga: SManga): Request = paginatedChapterListRequest(manga.url, 1)
-
-    override fun chapterListParse(response: Response): List<SChapter> {
+    private suspend fun fetchChapterList(mangaId: String): List<SChapter> {
         val allChapters = mutableListOf<SChapter>()
-        val mangaId = response.request.url.queryParameter("series_id")!!
-
-        lateinit var chapterListDto: ChapterListDto
 
         var page = 1
         do {
-            chapterListDto = if (page == 1) {
-                response.parseAs()
-            } else {
-                client.newCall(
-                    paginatedChapterListRequest(mangaId, page),
-                ).execute().parseAs()
-            }
+            val url = "$baseUrl/ajax/load_chapters.php".toHttpUrl().newBuilder()
+                .addQueryParameter("series_id", mangaId)
+                .addQueryParameter("page", page.toString())
+                .addQueryParameter("order", "newest_first")
+                .build()
+
+            val chapterListDto = client.get(url, apiHeaders, Fetch.XHR).parseAs<ChapterListDto>()
 
             val doc = Jsoup.parseBodyFragment(chapterListDto.html, baseUrl)
             allChapters.addAll(parseChapterList(doc, mangaId))
@@ -172,17 +145,18 @@ abstract class Yupmanga : HttpSource() {
         return allChapters
     }
 
-    private fun parseChapterList(document: Document, mangaId: String): List<SChapter> {
-        return document.select("div.comic-card").mapNotNull { element ->
-            val chapterId = element.selectFirst("a[data-chapter]")?.attr("data-chapter")
-                ?: return@mapNotNull null
-            val chapterName = element.selectFirst("h3")?.text()
-                ?: return@mapNotNull null
+    // A chapter is kept by its number key: the data-chapter id changes on each visit of the site
+    private fun parseChapterList(document: Document, mangaId: String): List<SChapter> = document.select("div.comic-card").mapNotNull { element ->
+        val chapterKey = element.selectFirst("a[data-chapter-key]")?.attr("data-chapter-key")
+            ?.takeIf(CHAPTER_KEY_REGEX::matches)
+            ?: return@mapNotNull null
+        val chapterName = element.selectFirst("h3")?.text()
+            ?: return@mapNotNull null
 
-            SChapter.create().apply {
-                name = chapterName
-                url = "$chapterId#$mangaId"
-            }
+        SChapter.create().apply {
+            name = chapterName
+            url = "$chapterKey#$mangaId"
+            chapter_number = chapterKey.toFloat()
         }
     }
 
@@ -195,157 +169,158 @@ abstract class Yupmanga : HttpSource() {
         return "$baseUrl/series.php?id=$mangaId"
     }
 
-    override fun pageListRequest(chapter: SChapter): Request {
-        val chapterId: String
-        val mangaId: String
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val chapterKey = chapter.url.substringBefore("#")
+        val seriesId = chapter.url.substringAfter("#", "")
+        // Chapters listed before the site keyed them by number hold an id that it no longer accepts
+        if (!CHAPTER_KEY_REGEX.matches(chapterKey) || seriesId.isEmpty()) throw Exception(OUTDATED)
 
-        // Handling backward compatibility for old SChapter.url format
-        if (chapter.url.startsWith("/ajax/")) {
-            val url = "$baseUrl${chapter.url}".toHttpUrl()
-            chapterId = url.queryParameter("chapter") ?: throw Exception("ID de capítulo inválido")
-            mangaId = url.queryParameter("s") ?: ""
-        } else {
-            chapterId = chapter.url.substringBefore("#")
-            mangaId = chapter.url.substringAfter("#")
-        }
+        // Each visit of the series page renders anew the hidden element whose styles the challenge reads
+        val seriesUrl = getChapterUrl(chapter)
+        val seriesPage = client.get(seriesUrl, Fetch.DOCUMENT).asJsoup()
+        val challenge = client.post("$baseUrl/ajax/get_challenge.php", apiHeaders, Fetch.XHR.from(seriesUrl), chapterForm(chapterKey, seriesId).build())
+            .parseAs<ChallengeDto>()
+        val challengeId = challenge.challengeId
+        val challengeJs = challenge.challengeJs
+        if (!challenge.success || challengeId == null || challengeJs == null) throw Exception("Error fetching challenge")
 
-        // If opened directly from the library/cached details and csrfToken is empty,
-        // we must fetch the series page to trigger the interceptor and populate the values.
-        if (csrfToken.isEmpty() && mangaId.isNotEmpty()) {
-            client.newCall(GET("$baseUrl/series.php?id=$mangaId", headers)).execute().close()
-        }
-
-        val requestHeaders = apiHeaders.newBuilder().apply {
-            if (csrfToken.isNotEmpty()) {
-                add("X-CSRF-Token", csrfToken)
-            }
-        }.build()
-
-        val anchorUrl = "$baseUrl/ajax/get_anchor.php?s=$mangaId"
-        val anchorResponse = client.newCall(GET(anchorUrl, requestHeaders)).execute()
-        val anchorValue = anchorResponse.parseAs<AnchorDto>().v ?: throw Exception("Failed to get anchor")
-
-        val challengeBody = FormBody.Builder()
-            .add("chapter", chapterId)
-            .apply {
-                if (mangaId.isNotEmpty()) add("s", mangaId)
-            }
+        val form = chapterForm(chapterKey, seriesId)
+            .add("challenge_id", challengeId)
+            .add("answer", solveChallenge(challengeJs, seriesPage))
             .build()
-        val challengeUrl = "$baseUrl/ajax/get_challenge.php"
+        val response = client.post("$baseUrl/ajax/open_chapter.php", apiHeaders, Fetch.XHR.from(seriesUrl), form, ensureSuccess = false)
+        val access = response.parseAs<TokenDto>()
+        // Guests can only open a limited number of chapters
+        if (response.code == 429) throw Exception(access.message ?: "Límite de lectura alcanzado")
+        val token = access.token?.takeIf { access.success } ?: throw Exception(access.error ?: OUTDATED)
+        val chapterId = access.chapterId ?: throw Exception(OUTDATED)
 
-        val challenge = client.newCall(POST(challengeUrl, apiHeaders, challengeBody)).execute().parseAs<ChallengeDto>()
-        if (!challenge.success || challenge.challengeJs == null || challenge.challengeId == null) {
-            throw Exception("Error fetching challenge")
-        }
-
-        val sanitizedJs = challenge.challengeJs
-            .replace("return (async function(){", "return (function(){")
-            .replace(INNER_CHALLENGE_REGEX, "\"$anchorValue\"")
-
-        val answer = QuickJs.create().use {
-            it.evaluate(
-                """
-                var document = {
-                    getElementById: function(id) {
-                        if (id === 'ym-f2') {
-                            return {
-                                elements: {
-                                    'k2': { value: "$anchorValue" }
-                                }
-                            };
-                        }
-                        return null;
-                    }
-                };
-                var window = {};
-                var atob = function(input) {
-                    var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-                    var str = String(input).replace(/=+$/, '');
-                    var output = '';
-                    for (var bc = 0, bs, fn, idx = 0; idx < str.length; ) {
-                        var char = str.charAt(idx++);
-                        var index = chars.indexOf(char);
-                        if (index === -1) continue;
-                        bs = bc % 4 ? bs * 64 + index : index;
-                        if (bc++ % 4) {
-                            output += String.fromCharCode(255 & bs >> (-2 * bc & 6));
-                        }
-                    }
-                    return output;
-                };
-                (function() {
-                    $sanitizedJs
-                })();
-                """.trimIndent(),
-            )?.toString()
-        } ?: throw Exception("Failed to solve challenge")
-
-        val formBody = FormBody.Builder()
-            .add("chapter", chapterId)
-            .add("challenge_id", challenge.challengeId)
-            .add("answer", answer)
-            .build()
-        val request = POST("$baseUrl/ajax/get_reader_token.php", apiHeaders, formBody)
-
-        val tokenDto = client.newCall(request).execute().parseAs<TokenDto>()
-        if (!tokenDto.success || tokenDto.token.isNullOrEmpty()) {
-            throw Exception("Información desactualizada. Refresque la lista de capítulos.")
-        }
-
-        val realChapterId = tokenDto.chapterId ?: chapterId
         val readerUrl = "$baseUrl/reader_v2.php".toHttpUrl().newBuilder()
-            .addQueryParameter("chapter", realChapterId)
-            .addQueryParameter("token", tokenDto.token)
+            .addQueryParameter("chapter", chapterId)
+            .addQueryParameter("token", token)
             .addQueryParameter("page", "1")
             .build()
+        var reader = client.get(readerUrl, Fetch.DOCUMENT.from(seriesUrl)).asJsoup()
+        // The reader is sometimes behind an ad page, which lets it through once its countdown is over
+        if (reader.location().toHttpUrl().encodedPath == "/box-modal.php") {
+            passInterstitial(reader)
+            reader = client.get(readerUrl, Fetch.DOCUMENT.from(reader.location())).asJsoup()
+        }
 
-        return GET(readerUrl, headers)
+        // In 'Manga' mode only the first image is in the DOM, so the pages come from the inline config script
+        val totalPages = reader.selectFirst("script:containsData(totalPages:)")?.data()
+            ?.let { TOTAL_PAGES_REGEX.find(it)?.groupValues?.get(1)?.toIntOrNull() }
+            ?: throw Exception("No se pudo cargar el capítulo")
+        val images = "$baseUrl/image-proxy-v2.php".toHttpUrl()
+        return (1..totalPages).map { page ->
+            val url = images.newBuilder()
+                .addQueryParameter("chapter", chapterId)
+                .addQueryParameter("page", page.toString())
+                .addQueryParameter("token", token)
+                .addQueryParameter("context", "reader")
+                .build()
+            Page(page - 1, imageUrl = url.toString())
+        }
     }
 
-    override fun pageListParse(response: Response): List<Page> {
-        val document = response.asJsoup()
-        val requestUrl = response.request.url
+    private fun chapterForm(chapterKey: String, seriesId: String) = FormBody.Builder()
+        .add("chapter_key", chapterKey)
+        .add("s", seriesId)
 
-        val chapterId = requestUrl.queryParameter("chapter")
-        val token = requestUrl.queryParameter("token")
+    // The ad page's ticket only counts once its countdown has run, which the site checks on its server
+    private suspend fun passInterstitial(page: Document) {
+        val html = page.html()
+        val ticket = AD_TICKET_REGEX.find(html)?.groupValues?.get(1)?.parseAs<AdTicketDto>()
+            ?: throw Exception("No se pudo cargar el capítulo")
+        delay((COUNTDOWN_REGEX.find(html)?.groupValues?.get(1)?.toIntOrNull() ?: 8).seconds)
+        repeat(3) {
+            val body = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("identifier", "chapter_entrance")
+                .addFormDataPart("chapter", ticket.chapter)
+                .addFormDataPart("nonce", ticket.nonce)
+                .build()
+            val response = client.post("$baseUrl/ajax/complete_ad_interstitial.php", apiHeaders, Fetch.XHR.from(page.location()), body, ensureSuccess = false)
+            response.close()
+            // 409: the server's clock hasn't reached the end of the countdown yet
+            if (response.code != 409) return
+            delay(1500.milliseconds)
+        }
+    }
 
-        // In 'Manga' mode, only the first image is present in the DOM, so we must rely on the inline config script.
-        // This will successfully generate the pages accurately for both Webtoon & Manga modes.
-        val scriptData = document.selectFirst("script:containsData(totalPages:)")?.data()
+    // The challenge sorts the children of a hidden element by their CSS order and reads their flex values. The page's
+    // rules are made to mislead a plain reading (decoys for missing classes, !important, two classes over one), so the
+    // cascade is worked out here, and the challenge runs against a stand-in for document and window.
+    private fun solveChallenge(challengeJs: String, page: Document): String {
+        val script = """
+            var dom = ${hiddenStyles(page)};
+            var defaults = { "order": "0", "flex-grow": "0", "flex-shrink": "1" };
+            function node(o) { return { children: (o.children || []).map(node), style: o.style || {} }; }
+            var document = { getElementById: function(id) { return dom[id] ? node(dom[id]) : null; } };
+            var window = {
+                getComputedStyle: function(e) {
+                    return { getPropertyValue: function(p) { return p in e.style ? e.style[p] : (defaults[p] || ""); } };
+                }
+            };
+            (function() { $challengeJs })();
+        """.trimIndent()
+        return QuickJs.create().use { it.evaluate(script)?.toString() } ?: throw Exception("Failed to solve challenge")
+    }
 
-        if (scriptData != null && chapterId != null && token != null) {
-            val totalPagesStr = scriptData.substringAfter("totalPages:").substringBefore(",").trim()
-            val totalPages = totalPagesStr.toIntOrNull()
-
-            if (totalPages != null && totalPages > 0) {
-                return (1..totalPages).map { pageNum ->
-                    val imageUrl = "$baseUrl/image-proxy-v2.php?chapter=$chapterId&page=$pageNum&token=$token&context=reader"
-                    Page(pageNum - 1, imageUrl = imageUrl)
+    // For each element that the page's rules target by id, the declarations its children end up with
+    private fun hiddenStyles(page: Document): String {
+        val css = page.select("style").joinToString("\n") { it.data() }.replace(CSS_COMMENT_REGEX, "")
+        val declarations = CSS_RULE_REGEX.findAll(css).withIndex().flatMap { (index, rule) ->
+            val properties = rule.groupValues[2].split(';').mapNotNull { declaration ->
+                val parts = declaration.split(':', limit = 2).takeIf { it.size == 2 } ?: return@mapNotNull null
+                Triple(parts[0].trim().lowercase(), parts[1].replace("!important", "").trim(), "!important" in parts[1])
+            }
+            rule.groupValues[1].split(',').mapNotNull { CSS_SELECTOR_REGEX.matchEntire(it.trim()) }.flatMap { selector ->
+                val (id, tag, classes) = selector.destructured
+                properties.map { (name, value, important) ->
+                    CssDeclaration(id, tag, classes.split('.').filter(String::isNotEmpty).toSet(), name, value, important, index)
                 }
             }
-        }
-
-        // Fallback to DOM scraping just in case
-        return document.select("div#readerContent img.page-image").mapIndexed { index, img ->
-            Page(index, imageUrl = img.attr("abs:src"))
-        }
+        }.toList()
+        return buildJsonObject {
+            for ((id, rules) in declarations.groupBy { it.id }) {
+                val element = page.getElementById(id) ?: continue
+                putJsonObject(id) {
+                    putJsonArray("children") {
+                        for (child in element.children()) {
+                            val classes = child.classNames()
+                            val winners = rules.filter { (it.tag.isEmpty() || it.tag == child.tagName()) && classes.containsAll(it.classes) }
+                                .groupBy { it.name }
+                                .mapValues { (_, candidates) -> candidates.maxWith(compareBy({ it.important }, { it.specificity }, { it.index })).value }
+                            addJsonObject { putJsonObject("style") { winners.forEach { (name, value) -> put(name, value) } } }
+                        }
+                    }
+                }
+            }
+        }.toString()
     }
 
-    override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
-
-    private fun Regex.decodeChars(html: String): String = find(html)?.groupValues?.get(1)?.split(",")?.mapNotNull {
-        val clean = it.trim()
-        if (clean.startsWith("0x", ignoreCase = true)) {
-            clean.substring(2).toIntOrNull(16)?.toChar()
-        } else {
-            clean.toIntOrNull()?.toChar()
-        }
-    }?.joinToString("") ?: ""
+    private class CssDeclaration(
+        val id: String,
+        val tag: String,
+        val classes: Set<String>,
+        val name: String,
+        val value: String,
+        val important: Boolean,
+        val index: Int,
+    ) {
+        // Every rule here starts with the same id, so the classes and the tag decide
+        val specificity get() = classes.size * 10 + if (tag.isEmpty()) 0 else 1
+    }
 
     companion object {
-        private val TOKEN_REGEX = """id=["']csrf_token["']\s+value=["']([^"']+)["']""".toRegex()
-        private val TOKEN_META_REGEX = """name=["']csrf-token["'][^>]*?content=["']([^"']+)["']""".toRegex()
-        private val TOKEN_JS_REGEX = """(?:_token|csrf-token).*?String\.fromCharCode\(([^)]+)\)""".toRegex()
-        private val INNER_CHALLENGE_REGEX = """await\s+\(async\s+function\(\)\{[\s\S]+?\}\)\(\)""".toRegex()
+        private const val OUTDATED = "Información desactualizada. Refresque la lista de capítulos."
+        private val CHAPTER_KEY_REGEX = Regex("""\d+(?:\.\d+)?""")
+        private val TOTAL_PAGES_REGEX = Regex("""totalPages:\s*(\d+)""")
+        private val AD_TICKET_REGEX = Regex("""adTicket\s*=\s*(\{[^}]*\})""")
+        private val COUNTDOWN_REGEX = Regex("""let\s+countdown\s*=\s*(\d+)""")
+        private val CSS_COMMENT_REGEX = Regex("""/\*[\s\S]*?\*/""")
+        private val CSS_RULE_REGEX = Regex("""([^{}]+)\{([^{}]*)\}""")
+        private val CSS_SELECTOR_REGEX = Regex("""#([\w-]+)\s*>?\s*([a-z]*)((?:\.[\w-]+)+)""")
     }
 }

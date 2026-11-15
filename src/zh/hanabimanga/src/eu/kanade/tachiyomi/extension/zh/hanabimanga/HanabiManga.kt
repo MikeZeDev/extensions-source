@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.extension.zh.hanabimanga
 
+import android.os.Build
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
@@ -9,18 +10,21 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
 import keiyoushi.network.get
 import keiyoushi.network.post
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.getLong
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.getString
+import keiyoushi.utils.hmacSha256
 import keiyoushi.utils.int
 import keiyoushi.utils.parseAs
+import keiyoushi.utils.sha256
 import keiyoushi.utils.toJsonRequestBody
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.add
+import kotlinx.serialization.json.addAll
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
@@ -32,26 +36,26 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import java.io.IOException
 import java.util.Locale
-import kotlin.getValue
 
-const val ANONYMOUS_TOKEN =
+private const val ANONYMOUS_TOKEN =
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVoa3ZxcnhtY2FwZ3Rwc3BnbHJwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjM5NjgzMjksImV4cCI6MjA3OTU0NDMyOX0.uuHr888lp14ObW5eWowJrHPJGgQf3sF2l7NPmFN84g4"
-const val COMIC_BODY =
+private const val COMIC_BODY =
     "id,title,summary,cover_url,release_date,is_finished,authors,region,latest_chapter_title,tags(id,name),categories(id,name)"
-const val PAGE_SIZE = 20
+private const val APP_VERSION = "2.4.13"
+private const val APP_VERSION_CODE = 2041399
+private const val CERT_FINGERPRINT = "13a8c9fbdaf19115f39b48dc0f3a7c99568ebb0c91ba1a71218c76f53f7877a8"
+private const val NATIVE_SECRET = "7c6cb7f919a688c4c1f5eacf047d97dcd542cae8e3fc84d926160ad879bf3845"
+private const val PAGE_SIZE = 20
 
 @Source
 abstract class HanabiManga :
     KeiSource(),
     ConfigurableSource {
-
     override fun getHomeUrl() = "https://web.hanabimanga.com/zh-CN"
 
     override fun Headers.Builder.configureHeaders() = apply {
-        // add("Authorization", ANONYMOUS_TOKEN)
         add("apikey", ANONYMOUS_TOKEN)
         removeAll("Referer")
-        removeAll("Origin")
     }
 
     override fun OkHttpClient.Builder.configureClient() = apply {
@@ -69,10 +73,12 @@ abstract class HanabiManga :
     private val pref by getPreferencesLazy()
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        preferencesInternal(screen.context, pref).forEach(screen::addPreference)
+        preferencesInternal(screen.context, pref, ::clearTokens).forEach(screen::addPreference)
     }
 
     // Customize
+
+    private val signatureKey by lazy { (NATIVE_SECRET.hexToBytes() + CERT_FINGERPRINT.hexToBytes()).sha256() }
 
     private suspend fun token(): String {
         val httpUrl = getHomeUrl().toHttpUrl()
@@ -83,7 +89,7 @@ abstract class HanabiManga :
         if (refresh == null) return login()
 
         val refreshBody = buildJsonObject { put("refresh_token", refresh.value) }
-        val response = client.post("$baseUrl/auth/v1/token?grant_type=refresh_token", refreshBody.toJsonRequestBody(), false)
+        val response = client.post("$baseUrl/auth/v1/token?grant_type=refresh_token", Fetch.XHR, refreshBody.toJsonRequestBody(), false)
 
         return if (response.isSuccessful) {
             response.parseAs<JsonObject>().also(::saveTokens).getString("access_token")
@@ -93,16 +99,16 @@ abstract class HanabiManga :
     }
 
     private suspend fun login(): String {
-        val email = pref.getString("EMAIL", null)
-        val password = pref.getString("PASSWORD", null)
-        if (email == null || password == null) return ANONYMOUS_TOKEN
+        val email = pref.getString(PREF_EMAIL, null)
+        val password = pref.getString(PREF_PASSWORD, null)
+        if (email.isNullOrEmpty() || password.isNullOrEmpty()) return ANONYMOUS_TOKEN
 
         val body = buildJsonObject {
             put("email", email)
             put("password", password)
             putJsonObject("gotrue_meta_security") {}
         }
-        val response = client.post("$baseUrl/auth/v1/token?grant_type=password", body.toJsonRequestBody(), false)
+        val response = client.post("$baseUrl/auth/v1/token?grant_type=password", Fetch.XHR, body.toJsonRequestBody(), false)
         if (response.code == 400) throw Exception("登录失败，邮箱或密码错误")
 
         return response.parseAs<JsonObject>().also(::saveTokens).getString("access_token")
@@ -116,6 +122,14 @@ abstract class HanabiManga :
         val c2 = Cookie.Builder().name("refresh_token").value(json.getString("refresh_token")).domain(httpUrl.host)
             .expiresAt(expiresAt + 259200000L).build()
         client.cookieJar.saveFromResponse(httpUrl, listOf(c1, c2))
+    }
+
+    private fun clearTokens() {
+        val httpUrl = getHomeUrl().toHttpUrl()
+        val expired = listOf("access_token", "refresh_token").map {
+            Cookie.Builder().name(it).value("").domain(httpUrl.host).expiresAt(0).build()
+        }
+        client.cookieJar.saveFromResponse(httpUrl, expired)
     }
 
     private fun HttpUrl.Builder.addPaginationParameters(page: Int, order: String) = addQueryParameter("select", COMIC_BODY)
@@ -132,12 +146,42 @@ abstract class HanabiManga :
         },
     )
 
+    private fun mobilePageRequest(chapter: SChapter): JsonObject {
+        val comicId = chapter.memo["cid"]!!.int
+        val pages = List(chapter.memo["size"]!!.int) { "%03d".format(Locale.ROOT, it + 1) }
+        val timestamp = System.currentTimeMillis() / 1000
+        val canonicalPayload = "v1|comic_id=$comicId|chapter_id=${chapter.url}|pages=${pages.joinToString(",")}|timestamp=$timestamp"
+        val signature = canonicalPayload.hmacSha256(signatureKey).toHexString()
+        return buildJsonObject {
+            put("comic_id", comicId)
+            put("chapter_id", chapter.url)
+            putJsonArray("pages") { addAll(pages) }
+            put("timestamp", timestamp)
+            put("signature", signature)
+            putJsonObject("client_diag") {
+                put("native_status", "ok")
+                put("native_fingerprint_prefix", CERT_FINGERPRINT.take(8))
+                put("canonical_payload_sha256", canonicalPayload.sha256().toHexString())
+                put("signature_prefix", signature.take(16))
+                put("app_version", APP_VERSION)
+                put("app_version_code", APP_VERSION_CODE)
+                put("brand", Build.BRAND)
+                put("manufacturer", Build.MANUFACTURER)
+                put("model", Build.MODEL)
+                put("product", Build.PRODUCT)
+                put("sdk_int", Build.VERSION.SDK_INT)
+            }
+        }
+    }
+
+    private fun String.hexToBytes() = chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+
     // Popular
 
     override suspend fun getPopularManga(page: Int): MangasPage {
         val order = pref.getString(PREF_POPULAR_MANGA, "popularity_daily.desc.nullslast")!!
         val url = "$baseUrl/rest/v1/comics".toHttpUrl().newBuilder().addPaginationParameters(page, order).build()
-        val comics = client.get(url).parseAs<List<Comic>>()
+        val comics = client.get(url, Fetch.XHR).parseAs<List<Comic>>()
         return MangasPage(comics.map(Comic::toSManga), comics.size == PAGE_SIZE)
     }
 
@@ -145,7 +189,7 @@ abstract class HanabiManga :
 
     override suspend fun getLatestUpdates(page: Int): MangasPage {
         val url = "$baseUrl/rest/v1/comics".toHttpUrl().newBuilder().addPaginationParameters(page, "updated_at.desc.nullslast").build()
-        val comics = client.get(url).parseAs<List<Comic>>()
+        val comics = client.get(url, Fetch.XHR).parseAs<List<Comic>>()
         return MangasPage(comics.map(Comic::toSManga), comics.size == PAGE_SIZE)
     }
 
@@ -156,7 +200,7 @@ abstract class HanabiManga :
     override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
         val comics = if (query.isNotBlank()) {
             val body = mapOf("search_term" to query, "items_per_page" to "$PAGE_SIZE", "page_number" to "$page")
-            client.post("$baseUrl/rest/v1/rpc/search_comics_pgroonga", body.toJsonRequestBody()).parseAs<List<Comic>>()
+            client.post("$baseUrl/rest/v1/rpc/search_comics_pgroonga", Fetch.XHR, body.toJsonRequestBody()).parseAs<List<Comic>>()
         } else {
             val url = "$baseUrl/rest/v1/comics".toHttpUrl().newBuilder().apply {
                 addPaginationParameters(page, filters[2].toString())
@@ -164,7 +208,7 @@ abstract class HanabiManga :
                 if (filters[4].toString().isNotBlank()) addQueryParameter("is_finished", "eq.${filters[4]}")
                 if (filters[3].toString().isNotBlank()) addQueryParameter("region", "eq.${filters[3]}")
             }
-            client.get(url.build()).parseAs<List<Comic>>()
+            client.get(url.build(), Fetch.XHR).parseAs<List<Comic>>()
         }
         return MangasPage(comics.map(Comic::toSManga), comics.size == PAGE_SIZE)
     }
@@ -183,7 +227,7 @@ abstract class HanabiManga :
     ): SMangaUpdate {
         val url = "$baseUrl/rest/v1/comics".toHttpUrl().newBuilder().addQueryParameter("id", "eq.${manga.url}")
             .addSelectParameter(fetchDetails, fetchChapters).build()
-        val response = client.get(url)
+        val response = client.get(url, Fetch.XHR)
         val comic = response.parseAs<List<Comic>>().first()
 
         val smanga = if (fetchDetails) comic.toSManga() else manga
@@ -204,23 +248,20 @@ abstract class HanabiManga :
             put("p_category_id", manga.memo["category_id"]!!.int)
             put("p_exclude_comic_id", manga.url)
         }
-        val comics = client.post("$baseUrl/rest/v1/rpc/get_random_comics", body.toJsonRequestBody()).parseAs<List<Comic>>()
+        val comics = client.post("$baseUrl/rest/v1/rpc/get_random_comics", Fetch.XHR, body.toJsonRequestBody()).parseAs<List<Comic>>()
         return comics.map(Comic::toSManga)
     }
 
     // Page
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
-        val body = buildJsonObject {
-            put("comic_id", chapter.memo["cid"]!!.int)
-            put("chapter_id", chapter.url)
-            putJsonArray("pages") {
-                repeat(chapter.memo["size"]!!.int) { add(String.format(Locale.getDefault(), "%03d", it + 1)) }
-            }
-        }
-        val label = if (pref.getBoolean(PREF_AI_SR, false)) "vip" else "sd"
-        val authHeader = headers.newBuilder().add("Authorization", "Bearer ${token()}").build()
-        val response = client.post("$baseUrl/functions/v1/$label-image-url", authHeader, body.toJsonRequestBody(), false)
+        val response = client.post(
+            "$baseUrl/functions/v1/${if (pref.getBoolean(PREF_AI_SR, false)) "vip" else "sd"}-image-url",
+            headers.newBuilder().add("Authorization", "Bearer ${token()}").build(),
+            Fetch.XHR,
+            mobilePageRequest(chapter).toJsonRequestBody(),
+            false,
+        )
         if (response.code == 401) response.use { throw Exception("请先在插件设置中登录") }
         if (response.code == 429) {
             when (response.parseAs<JsonObject>().getString("code")) {
@@ -229,7 +270,7 @@ abstract class HanabiManga :
             }
         }
         val result = response.parseAs<PagesResult>()
-        val info = with(result.scrambleInfo) { "$ticket|$nonce|$cols|$rows" }
-        return result.urls.mapIndexed { i, o -> Page(i, imageUrl = "${o.getString("url")}#$info") }
+        val fragment = result.scrambleInfo?.run { "#$ticket|$nonce|$cols|$rows" }.orEmpty()
+        return result.urls.mapIndexed { i, p -> Page(i, imageUrl = p.getString("url") + fragment) }
     }
 }

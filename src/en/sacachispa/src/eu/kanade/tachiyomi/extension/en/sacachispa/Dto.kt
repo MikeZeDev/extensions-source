@@ -1,83 +1,178 @@
 package eu.kanade.tachiyomi.extension.en.sacachispa
 
-import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.utils.tryParse
-import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
-import java.text.SimpleDateFormat
-import java.util.Locale
-import java.util.TimeZone
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import kotlin.time.Clock
+import kotlin.time.Instant
+
+private val CDN_URL = "https://cdn.sacachispa.site/".toHttpUrl()
+
+private fun String.toCoverUrl() = CDN_URL.resolve(this)?.toString()
+
+private fun String?.toStatus() = when (this) {
+    "ONGOING" -> SManga.ONGOING
+    "COMPLETED" -> SManga.COMPLETED
+    "HIATUS" -> SManga.ON_HIATUS
+    "DROPPED" -> SManga.CANCELLED
+    else -> SManga.UNKNOWN
+}
+
+private fun genreList(demographic: String?, genres: List<String>) = (listOfNotNull(demographic?.takeIf { it != "NONE" }) + genres)
+    .joinToString()
+    .ifEmpty { null }
 
 @Serializable
-class SeriesResponseDto(
-    val items: List<SeriesDto>,
-    val page: Int,
-    val totalPages: Int,
+class Data<T>(
+    val data: T,
 )
 
 @Serializable
-class SeriesDto(
-    private val title: String,
+class MangaListResponse(
+    val data: List<MangaListDto>,
+    val pagination: PaginationDto,
+)
+
+@Serializable
+class MangaListDto(
+    val id: String,
     private val slug: String,
-    private val description: String? = null,
-    @SerialName("cover_image_url") private val coverImageUrl: String? = null,
-    private val author: String? = null,
-    private val artist: String? = null,
+    private val title: String,
+    private val cover: String? = null,
+    private val authors: List<String> = emptyList(),
     private val status: String? = null,
-    private val genres: List<String> = emptyList(),
+    private val demographic: String? = null,
+    val genres: List<String> = emptyList(),
 ) {
     fun toSManga() = SManga.create().apply {
-        this.title = this@SeriesDto.title
-        this.url = slug
-        this.description = this@SeriesDto.description
-        this.thumbnail_url = coverImageUrl
-        this.author = this@SeriesDto.author
-        this.artist = this@SeriesDto.artist
-        this.genre = genres.joinToString()
-        this.status = when (this@SeriesDto.status?.lowercase()) {
-            "ongoing" -> SManga.ONGOING
-            "completed" -> SManga.COMPLETED
-            else -> SManga.UNKNOWN
-        }
+        url = id
+        memo = buildJsonObject { put("slug", slug) }
+        title = this@MangaListDto.title
+        thumbnail_url = cover?.toCoverUrl()
+        author = authors.joinToString().ifEmpty { null }
+        genre = genreList(demographic, genres)
+        status = this@MangaListDto.status.toStatus()
     }
 }
 
 @Serializable
-class RscChaptersDto(
-    val chapters: List<ChapterDto>,
-)
-
-@Serializable
-class RscPageDto(
-    val chapter: ChapterDto,
-)
-
-private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ROOT).apply {
-    timeZone = TimeZone.getTimeZone("UTC")
-}
-
-@Serializable
-class ChapterDto(
-    @SerialName("chapter_number") private val chapterNumber: Float,
-    private val title: String? = null,
-    @SerialName("created_at") private val createdAt: String? = null,
-    private val pages: List<String> = emptyList(),
+class MangaDetailDto(
+    val id: String,
+    private val slug: String,
+    private val title: String,
+    private val status: String,
+    private val authors: List<NamedDto>,
+    private val artists: List<NamedDto>,
+    private val genres: List<NamedDto>,
+    private val cover: String? = null,
+    private val synopses: List<SynopsisDto>,
+    private val titles: List<AltTitleDto>,
+    private val demographic: String? = null,
 ) {
-    fun toSChapter(slug: String) = SChapter.create().apply {
-        val numberStr = chapterNumber.toString().removeSuffix(".0")
-        url = "/series/$slug/chapter/$numberStr"
-
-        name = if (!title.isNullOrBlank()) {
-            "Chapter $numberStr - $title"
-        } else {
-            "Chapter $numberStr"
+    // A stored url can't change, so entries from before the site rewrite keep their slug url.
+    fun toSManga(storedUrl: String) = SManga.create().apply {
+        url = storedUrl
+        memo = buildJsonObject {
+            put("id", id)
+            put("slug", slug)
         }
-
-        chapter_number = chapterNumber
-        date_upload = dateFormat.tryParse(createdAt)
+        title = this@MangaDetailDto.title
+        thumbnail_url = cover?.toCoverUrl()
+        author = authors.joinToString { it.name }.ifEmpty { null }
+        artist = artists.joinToString { it.name }.ifEmpty { null }
+        genre = genreList(demographic, genres.map { it.name })
+        description = buildList {
+            synopses.firstOrNull()?.let { add(it.synopsis) }
+            val altTitles = titles.map { it.title }.distinct() - this@MangaDetailDto.title
+            if (altTitles.isNotEmpty()) {
+                add(altTitles.joinToString("\n", "**Alternative titles:**\n") { "- $it" })
+            }
+        }.joinToString("\n\n").ifEmpty { null }
+        status = this@MangaDetailDto.status.toStatus()
     }
-
-    fun toPageList(): List<Page> = pages.mapIndexed { index, imageUrl -> Page(index, imageUrl = imageUrl) }
 }
+
+@Serializable
+class NamedDto(
+    val name: String,
+)
+
+@Serializable
+class AltTitleDto(
+    val title: String,
+)
+
+@Serializable
+class SynopsisDto(
+    val synopsis: String,
+)
+
+@Serializable
+class ReleaseListResponse(
+    val data: List<ReleaseDto>,
+    val pagination: PaginationDto,
+)
+
+@Serializable
+class ReleaseDto(
+    private val id: String,
+    private val chapter: ChapterRefDto,
+    private val publishedAt: String,
+    val manga: MangaListDto,
+) {
+    fun toSChapter(hideLocked: Boolean): SChapter? {
+        val freeTime = Instant.tryParse(chapter.freeAt)
+        val isLocked = if (freeTime > 0L) freeTime > Clock.System.now().toEpochMilliseconds() else chapter.patreonOnly
+
+        if (hideLocked && isLocked) return null
+
+        return SChapter.create().apply {
+            url = id
+            name = buildString {
+                if (isLocked) append("🔒 ")
+                append("Chapter ", chapter.chapter)
+                chapter.title?.takeIf { it.isNotBlank() }?.let { append(" - ", it) }
+            }
+            chapter_number = chapter.chapter.toFloatOrNull() ?: -1f
+            date_upload = Instant.tryParse(publishedAt)
+        }
+    }
+}
+
+@Serializable
+class ChapterRefDto(
+    val chapter: String,
+    val title: String? = null,
+    val patreonOnly: Boolean,
+    val freeAt: String? = null,
+)
+
+@Serializable
+class PageListDto(
+    val items: List<PageDto>,
+)
+
+@Serializable
+class PageDto(
+    val url: String,
+)
+
+@Serializable
+class ErrorResponse(
+    val error: ErrorDto,
+)
+
+@Serializable
+class ErrorDto(
+    val message: String,
+)
+
+@Serializable
+class PaginationDto(
+    val page: Int,
+    val pages: Int,
+)

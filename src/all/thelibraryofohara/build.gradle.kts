@@ -8,7 +8,7 @@ keiyoushi {
     name = "The Library of Ohara"
     versionCode = 2
     contentWarning = ContentWarning.SAFE
-    libVersion = "1.4"
+    libVersion = "1.6"
 
     listOf("id", "en", "es", "it", "ar", "fr").forEach {
         source {

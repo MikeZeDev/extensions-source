@@ -1,50 +1,43 @@
 package eu.kanade.tachiyomi.extension.pt.lycantoons
 
-import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
+import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
+import keiyoushi.network.get
+import keiyoushi.network.post
 import keiyoushi.network.rateLimit
+import keiyoushi.source.KeiSource
 import keiyoushi.utils.extractNextJs
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonRequestBody
-import okhttp3.Request
-import okhttp3.Response
-import rx.Observable
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.serialization.json.JsonElement
+import okhttp3.Headers
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.OkHttpClient
 
 @Source
-abstract class LycanToons : HttpSource() {
+abstract class LycanToons : KeiSource() {
 
-    override val supportsLatest = true
+    override fun OkHttpClient.Builder.configureClient() = apply {
+        rateLimit(2)
+    }
 
-    override val client = network.client.newBuilder()
-        .addInterceptor(WebViewInterceptor(baseUrl, headers["User-Agent"]))
-        .rateLimit(2)
-        .build()
+    // The site refuses requests without Sec-Fetch-Site
+    override fun Headers.Builder.configureHeaders(): Headers.Builder = set("Sec-Fetch-Site", "same-origin")
 
-    override fun headersBuilder() = super.headersBuilder()
-        .add("Referer", "$baseUrl/")
+    override suspend fun getPopularManga(page: Int): MangasPage = metricsRequest("popular", page).parseAs<PopularResponse>().toMangasPage()
 
-    // =====================Popular=====================
+    override suspend fun getLatestUpdates(page: Int): MangasPage = metricsRequest("recently-updated", page).parseAs<PopularResponse>().toMangasPage()
 
-    override fun popularMangaRequest(page: Int): Request = metricsRequest("popular", page)
-
-    override fun popularMangaParse(response: Response): MangasPage = response.parseAs<PopularResponse>().toMangasPage()
-
-    // =====================Latest=====================
-
-    override fun latestUpdatesRequest(page: Int): Request = metricsRequest("recently-updated", page)
-
-    override fun latestUpdatesParse(response: Response): MangasPage = response.parseAs<PopularResponse>().toMangasPage()
-
-    // =====================Search=====================
-
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
         var search = query
         val tags = filters.selectedTags().toMutableList()
 
@@ -63,70 +56,67 @@ abstract class LycanToons : HttpSource() {
             tags = tags.distinct(),
         )
 
-        return POST("$baseUrl/api/series", headers, payload.toJsonRequestBody())
+        return client.post("$baseUrl/api/series", Fetch.XHR, payload.toJsonRequestBody())
+            .parseAs<SearchResponse>()
+            .toMangasPage()
     }
 
-    override fun searchMangaParse(response: Response): MangasPage = response.parseAs<SearchResponse>().toMangasPage()
+    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
+        if (url.host != baseUrl.toHttpUrl().host || url.pathSegments.getOrNull(0) != "series") return null
+        val slug = url.pathSegments.getOrNull(1)?.takeIf(String::isNotEmpty) ?: return null
+        val manga = SManga.create().apply { this.url = "/series/$slug" }
+        return fetchMangaUpdate(manga, emptyList(), fetchDetails = true, fetchChapters = false).manga
+    }
 
-    override fun getFilterList(): FilterList = LycanToonsFilters.get()
-
-    // =====================Details=====================
-
-    override fun getMangaUrl(manga: SManga): String = "$baseUrl${manga.url}"
-
-    override fun mangaDetailsRequest(manga: SManga): Request = rscRequest("$baseUrl/series/${manga.slug()}")
-
-    override fun mangaDetailsParse(response: Response): SManga = response.extractNextJs<SeriesDto>()!!.toSManga()
-
-    // =====================Chapters=====================
-
-    override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = Observable.fromCallable {
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate = coroutineScope {
         val slug = manga.slug()
 
-        val response = client.newCall(chapterPageRequest(slug)).execute()
+        val details = async {
+            if (fetchDetails) {
+                client.get("$baseUrl/series/$slug", Fetch.XHR).extractNextJs<SeriesDto>()!!.toSManga()
+            } else {
+                manga
+            }
+        }
 
-        response.extractNextJs<ChapterResponse>()?.capitulos!!
-            .map { it.toSChapter(slug) }
-            .sortedByDescending { it.chapter_number }
+        val chapterList = async {
+            if (fetchChapters) {
+                client.get("$baseUrl/series/$slug/1", Fetch.XHR).extractNextJs<ChapterResponse>()!!.capitulos
+                    .map { it.toSChapter(slug) }
+                    .sortedByDescending { it.chapter_number }
+            } else {
+                chapters
+            }
+        }
+
+        SMangaUpdate(details.await(), chapterList.await())
     }
 
-    private fun chapterPageRequest(slug: String): Request = rscRequest("$baseUrl/series/$slug/1")
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val chapterId = client.get(getChapterUrl(chapter), Fetch.XHR).extractNextJs<ChapterIdDto>()!!.capituloId
 
-    override fun chapterListParse(response: Response): List<SChapter> = throw UnsupportedOperationException()
-
-    // =====================Pages========================
-
-    override fun pageListRequest(chapter: SChapter): Request = rscRequest("$baseUrl${chapter.url}")
-
-    override fun pageListParse(response: Response): List<Page> {
-        val dto = response.extractNextJs<PageList>()
-
-        return dto?.imageUrls?.mapIndexed { index, imageUrl -> Page(index, imageUrl = imageUrl) }
-            ?: emptyList()
+        return client.get("$baseUrl/api/chapters/$chapterId/view-pages", Fetch.XHR)
+            .parseAs<PageList>()
+            .pages
+            .mapIndexed { index, imageUrl -> Page(index, imageUrl = imageUrl) }
     }
 
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
+    override fun getFilterList(data: JsonElement?): FilterList = FilterList(
+        SeriesTypeFilter(),
+        StatusFilter(),
+        TagsFilter(),
+    )
 
-    // =====================Utils=====================
-
-    private fun metricsRequest(path: String, page: Int): Request = GET("$baseUrl/api/metrics/$path?limit=$PAGE_LIMIT&page=$page", headers)
+    private suspend fun metricsRequest(path: String, page: Int) = client.get("$baseUrl/api/metrics/$path?limit=$PAGE_LIMIT&page=$page", Fetch.XHR)
 
     private fun SManga.slug(): String = url.substringBefore("?").substringAfterLast("/")
 
-    private fun String.rscBust() = "$this?_rsc=${List(5) { BASE36.random() }.joinToString("")}"
-
-    private fun getRscHeaders(url: String) = headers.newBuilder()
-        .add("next-router-state-tree", NEXT_ROUTER)
-        .add("next-url", url.removePrefix(baseUrl))
-        .add("RSC", "1")
-        .build()
-
-    private fun rscRequest(url: String) = GET(url.substringBefore("?").rscBust(), getRscHeaders(url))
-
     companion object {
         private const val PAGE_LIMIT = 20
-        private const val CHAPTER_LIMIT = 100
-        private const val BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
-        private const val NEXT_ROUTER = "%5B%22%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
     }
 }

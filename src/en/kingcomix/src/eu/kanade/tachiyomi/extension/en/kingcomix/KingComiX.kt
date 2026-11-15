@@ -8,10 +8,11 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import eu.kanade.tachiyomi.source.model.UpdateStrategy
-import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
 import keiyoushi.network.get
 import keiyoushi.source.KeiSource
+import keiyoushi.utils.asJsoup
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.tryParse
 import kotlinx.serialization.json.JsonElement
@@ -33,7 +34,7 @@ abstract class KingComiX : KeiSource() {
             url.addPathSegment(page.toString())
         }
         url.addPathSegment("") // Adds trailing slash natively
-        val document = client.get(url.build()).asJsoup()
+        val document = client.get(url.build(), Fetch.DOCUMENT).asJsoup()
 
         return parseFilteredManga(document, page)
     }
@@ -71,7 +72,7 @@ abstract class KingComiX : KeiSource() {
         }
         url.addPathSegment("") // Adds trailing slash natively
 
-        val document = client.get(url.build()).asJsoup()
+        val document = client.get(url.build(), Fetch.DOCUMENT).asJsoup()
         return parseFilteredManga(document, page)
     }
 
@@ -113,7 +114,7 @@ abstract class KingComiX : KeiSource() {
         fetchChapters: Boolean,
     ): SMangaUpdate {
         val url = baseUrl + manga.url
-        val document = client.get(url).asJsoup()
+        val document = client.get(url, Fetch.DOCUMENT).asJsoup()
         return SMangaUpdate(parseMangaDetails(document), parseChapterList(document, url))
     }
 
@@ -141,7 +142,7 @@ abstract class KingComiX : KeiSource() {
 
     // =============================== Pages ================================
     override suspend fun getPageList(chapter: SChapter): List<Page> {
-        val document = client.get(baseUrl + chapter.url).asJsoup()
+        val document = client.get(baseUrl + chapter.url, Fetch.DOCUMENT).asJsoup()
 
         return document.select(".entry-content img").mapIndexed { i, img ->
             val url = img.attr("abs:data-src").ifEmpty { img.attr("abs:src") }

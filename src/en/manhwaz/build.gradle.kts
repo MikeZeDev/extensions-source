@@ -6,13 +6,12 @@ plugins {
 
 keiyoushi {
     name = "ManhwaZ"
-    versionCode = 37
+    versionCode = 44
     contentWarning = ContentWarning.MIXED
-    libVersion = "1.4"
-    theme = "manhwaz"
+    libVersion = "1.6"
 
     source {
         lang = "en"
-        baseUrl = "https://manhwaz.com"
+        baseUrl = "https://manhwaz.cc"
     }
 }

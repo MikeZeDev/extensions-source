@@ -6,13 +6,14 @@ plugins {
 
 keiyoushi {
     name = "MangaHub"
-    versionCode = 2
+    versionCode = 0
     contentWarning = ContentWarning.NSFW
-    libVersion = "1.4"
-    theme = "zeistmanga"
+    libVersion = "1.6"
+    theme = "madara"
 
     source {
         lang = "ar"
-        baseUrl = "https://www.mangaxhentai.com"
+        baseUrl = "https://mangaxhentai.com"
+        versionId = 2
     }
 }

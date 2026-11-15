@@ -13,12 +13,14 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
-import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.network.Fetch
 import keiyoushi.network.get
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
+import keiyoushi.utils.asJsoup
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
+import keiyoushi.utils.ratingStars
 import keiyoushi.utils.toJsonElement
 import keiyoushi.utils.tryParseDate
 import kotlinx.coroutines.async
@@ -41,6 +43,7 @@ import java.util.Locale
 abstract class GroupLe :
     KeiSource(),
     ConfigurableSource {
+
     private val preferences: SharedPreferences by getPreferencesLazy()
 
     protected open val siteId: Int get() = 0
@@ -49,9 +52,6 @@ abstract class GroupLe :
 
     private val apiHeaders get() = headersBuilder()
         .set("Accept", "application/json, text/plain, */*")
-        .set("Sec-Fetch-Dest", "empty")
-        .set("Sec-Fetch-Mode", "cors")
-        .set("Sec-Fetch-Site", "cross-site")
         .build()
 
     override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = apply {
@@ -145,6 +145,7 @@ abstract class GroupLe :
                     val loginRequest = request.newBuilder()
                         .url(loginUrl)
                         .headers(headers)
+                        .header("Origin", baseUrl)
                         .post(verifyBody)
                         .build()
 
@@ -227,7 +228,7 @@ abstract class GroupLe :
             }
         }.build()
 
-        val result = client.get(url, apiHeaders).parseAs<SearchResponse>()
+        val result = client.get(url, apiHeaders, Fetch.XHR).parseAs<SearchResponse>()
         val mangas = result.list.map { it.toSManga() }
         return MangasPage(mangas, result.hasNextPage)
     }
@@ -251,7 +252,7 @@ abstract class GroupLe :
         fetchChapters: Boolean,
     ): SMangaUpdate {
         val newUrl = manga.url
-        val document = client.get("${baseUrl}$newUrl").asJsoup()
+        val document = client.get("${baseUrl}$newUrl", Fetch.DOCUMENT).asJsoup()
 
         val mangaNew = parseMangaDetails(document, newUrl)
         val chaptersNew = if (fetchChapters) {
@@ -335,7 +336,7 @@ abstract class GroupLe :
         val ratingSummary = ratingValue?.let { rating ->
             val ratingVotes = document.selectFirst(".cr-hero-rating__text")?.text()?.filter { it.isDigit() } ?: "0"
 
-            "${ratingToStars(rating)} $rating (голосов: $ratingVotes)"
+            "${ratingStars(rating.toDouble())} $rating (голосов: $ratingVotes)"
         }
 
         val descriptionText = document.selectFirst(".cr-description__content")?.text()
@@ -367,20 +368,6 @@ abstract class GroupLe :
         "R", "G", "PG" -> "16+"
         "PG-13" -> "12+"
         else -> rawAgeValue
-    }
-
-    protected fun ratingToStars(ratingValue: Float): String = when {
-        ratingValue > 9.5f -> "★★★★★"
-        ratingValue > 8.5f -> "★★★★✬"
-        ratingValue > 7.5f -> "★★★★☆"
-        ratingValue > 6.5f -> "★★★✬☆"
-        ratingValue > 5.5f -> "★★★☆☆"
-        ratingValue > 4.5f -> "★★✬☆☆"
-        ratingValue > 3.5f -> "★★☆☆☆"
-        ratingValue > 2.5f -> "★✬☆☆☆"
-        ratingValue > 1.5f -> "★☆☆☆☆"
-        ratingValue > 0.5f -> "✬☆☆☆☆"
-        else -> "☆☆☆☆☆"
     }
 
     // ============================== Chapters Details ===============================
@@ -474,10 +461,10 @@ abstract class GroupLe :
                 httpUrl
             }
         }
-        val document = client.get(url, ensureSuccess = false).use { response ->
+        val document = client.get(url, Fetch.DOCUMENT, ensureSuccess = false).use { response ->
             if (!response.isSuccessful) {
                 if (response.code == 404) {
-                    throw Exception("Для просмотра главы необходима авторизация через WebView\uD83C\uDF0E (Ошибка 404)  или включите автоматическую авторизацию в настройках расширения")
+                    throw Exception("Для просмотра главы необходима авторизация через WebView\uD83C\uDF0E (Ошибка 404). Авторизуйтесь в WebView и обновите мангу.")
                 } else {
                     throw HttpException(response.code)
                 }
@@ -539,7 +526,7 @@ abstract class GroupLe :
 
     override suspend fun fetchRelatedMangaList(manga: SManga): List<SManga> {
         val url = "$baseUrl/list/like${manga.url.substringBefore("__")}"
-        val document = client.get(url).asJsoup()
+        val document = client.get(url, Fetch.DOCUMENT).asJsoup()
         return document.select(".entity-cards-grid .similar-item-card").mapNotNull {
             SManga.create().apply {
                 setUrlWithoutDomain(it.selectFirst("a.entity-card-tile")?.absUrl("href") ?: return@mapNotNull null)
@@ -556,8 +543,8 @@ abstract class GroupLe :
     override suspend fun fetchFilterData(): JsonElement = coroutineScope {
         // Так же доступны в API /api/catalog/elementsByType?type=
         // Для каждого типа фильтров свой запрос, например жанры: /api/catalog/elementsByType?type=2
-        val resultDeferred = async { client.get("$baseUrl/search/advanced").asJsoup() }
-        val result2Deferred = async { client.get("$baseUrl/api/catalog/elementsByType?type=40").parseAs<FiltersAPIResponse>() }
+        val resultDeferred = async { client.get("$baseUrl/search/advanced", Fetch.DOCUMENT).asJsoup() }
+        val result2Deferred = async { client.get("$baseUrl/api/catalog/elementsByType?type=40", Fetch.XHR).parseAs<FiltersAPIResponse>() }
 
         val result = resultDeferred.await()
         val result2 = result2Deferred.await()
@@ -606,18 +593,17 @@ abstract class GroupLe :
     }
 
     // ============================== Utilities ===============================
-    // Old authGuard() doesn't work properly now. Previously it checked only certain sites, but now any manga on any site can require authorization
-    // Example: https://a.zazaza.me/podniatie_urovnia_v_odinochku__A5ea4
-    // Now all HTML elements related to chapters have two classes: blockedForAnonymous, blockedNonB
-    // When needed site adds JavaScript to the HTML that applies hidden status to these classes in CSS. authGuard now checks that this JS code are present in the HTML body
-    // Check should be universal. AllHentai uses same classes, but different JS code, so it requires its own override/check
     protected open fun authGuard(document: Document) {
-        document.select("script:containsData(UI.ViewHide)").joinToString().let {
-            if (it.contains("\"name\":\"blockedForAnonymous\"") && document.selectFirst(".user-avatar") == null) {
-                throw Exception("Для просмотра контента необходима авторизация через WebView\uD83C\uDF0E или включите автоматическую авторизацию в настройках расширения")
+        document.selectFirst("script:containsData(viewSettings)")?.data()?.let { authReq ->
+            val blockedCode = BLOCKED_ANON_REGEX.find(authReq)?.value
+            val isBlocked = blockedCode?.contains(ALLOW_ANONYMOUS_REGEX) ?: false
+
+            if (isBlocked && document.selectFirst("script:containsData(window.current_user_id)") == null) {
+                throw Exception("Для просмотра контента необходима авторизация через WebView🌍 или включите автоматическую авторизацию в настройках расширения")
             }
         }
     }
+
     private fun checkMinRange(input: String?, min: Int, max: Int): String {
         val value = input?.trim()?.takeIf(String::isNotEmpty)?.toIntOrNull() ?: return min.toString()
         if (value !in min..max) return min.toString()
@@ -732,6 +718,8 @@ abstract class GroupLe :
         private val SINGLE_REGEX = Regex("""\s*Сингл\s*""")
         private val FILTERS_REGEX = """window\.__FILTERS\.(\w+)\s*=\s*([{].*?[}]);""".toRegex()
         private val PAGES_REGEX = """\[['"](.*?)['"],['"](.*?)['"],['"](.*?)['"].*?]""".toRegex()
+        private val BLOCKED_ANON_REGEX = """\{[^{}]*?['"]blockedForAnonymous['"][^{}]*?\}""".toRegex()
+        private val ALLOW_ANONYMOUS_REGEX = """enabled:\s*true""".toRegex()
         private val CHECK_JSON = """(\w+)\s*:""".toRegex()
         private val dateFormat = DateTimeFormatter.ofPattern("[dd.MM.yy][d.MM.yy]", Locale.ROOT)
         private val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "gif", "webp", "avif", "svg")

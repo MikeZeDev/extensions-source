@@ -6,18 +6,17 @@ plugins {
 
 keiyoushi {
     name = "Sunshine Butterfly Scans"
-    versionCode = 39
+    versionCode = 3
     contentWarning = ContentWarning.NSFW
-    libVersion = "1.4"
+    libVersion = "1.6"
 
     source {
         lang = "en"
         baseUrl = "https://wings.sbs"
         versionId = 2
     }
-}
 
-dependencies {
-
-    implementation(project(":lib:cryptoaes"))
+    deeplink {
+        path("/projects")
+    }
 }

@@ -1,314 +1,430 @@
 package eu.kanade.tachiyomi.extension.zh.jinmantiantang
 
+import android.os.Handler
+import android.os.Looper
+import android.text.InputType
 import android.util.Base64
+import android.widget.Toast
+import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
-import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.asObservableSuccess
+import androidx.preference.SwitchPreferenceCompat
+import eu.kanade.tachiyomi.network.HttpException
 import eu.kanade.tachiyomi.source.ConfigurableSource
+import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
-import eu.kanade.tachiyomi.util.asJsoup
+import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
-import keiyoushi.lib.randomua.addRandomUAPreference
-import keiyoushi.lib.randomua.setRandomUserAgent
+import keiyoushi.network.Fetch
+import keiyoushi.network.get
+import keiyoushi.network.post
 import keiyoushi.network.rateLimit
+import keiyoushi.source.KeiSource
+import keiyoushi.utils.aesDecrypt
+import keiyoushi.utils.aesEcb
+import keiyoushi.utils.applicationContext
+import keiyoushi.utils.firstInstance
+import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.getPreferences
-import keiyoushi.utils.tryParse
+import keiyoushi.utils.md5
+import keiyoushi.utils.parseAs
+import keiyoushi.utils.toJsonElement
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.SerializationException
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import okhttp3.Headers
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Interceptor
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
-import okhttp3.Request
+import okhttp3.RequestBody
 import okhttp3.Response
-import org.jsoup.nodes.Document
-import org.jsoup.nodes.Element
-import org.jsoup.select.Elements
-import rx.Observable
-import java.text.SimpleDateFormat
-import java.util.Locale
+import java.io.IOException
+import java.time.LocalDate
+import kotlin.time.Clock
 import kotlin.time.Duration.Companion.seconds
 
 @Source
 abstract class Jinmantiantang :
-    HttpSource(),
+    KeiSource(),
     ConfigurableSource {
-
-    override val supportsLatest: Boolean = true
-
     private val preferences = getPreferences { preferenceMigration() }
 
-    override val baseUrl: String = "https://" + preferences.baseUrl
+    override val supportsRelatedMangas get() = true
 
-    private val updateUrlInterceptor = UpdateUrlInterceptor(preferences)
-
-    // 处理URL请求
-    override val client: OkHttpClient = network.client
-        .newBuilder()
-        .apply { interceptors().add(0, updateUrlInterceptor) }
-        .addInterceptor(ScrambledImageInterceptor)
-        // Add rate limit to fix manga thumbnail load failure
-        .rateLimit(
-            preferences.getString(MAINSITE_RATELIMIT_PREF, MAINSITE_RATELIMIT_PREF_DEFAULT)!!.toInt(),
-            preferences.getString(MAINSITE_RATELIMIT_PERIOD, MAINSITE_RATELIMIT_PERIOD_DEFAULT)!!.toLong().seconds,
-        ) { it.host == baseUrl.toHttpUrl().host }
-        .build()
-
-    // 添加额外的header增加规避Cloudflare可能性
-    override fun headersBuilder() = super.headersBuilder()
-        .set("Referer", "$baseUrl/")
-        .setRandomUserAgent()
-
-    // 点击量排序(人气)
-    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/albums?o=mv&page=$page", headers)
-
-    override fun popularMangaParse(response: Response): MangasPage {
-        val document = response.asJsoup()
-        val mangas = document.select("div.list-col > div.p-b-15:not([data-group])").map { element ->
-            popularMangaFromElement(element)
-        }.filterGenre()
-        val hasNextPage = document.selectFirst("a.prevnext") != null
-        return MangasPage(mangas, hasNextPage)
+    override fun OkHttpClient.Builder.configureClient() = apply {
+        addInterceptor(ScrambledImageInterceptor)
+        addInterceptor(::dropFailedApiHost)
+        rateLimit(3, 2.seconds) { it.host == apiHost }
     }
+
+    override suspend fun getPopularManga(page: Int): MangasPage {
+        // The automatic check-in tries once a day
+        if (preferences.getBoolean(CHECKIN_PREF, false) && preferences.getString(CHECKIN_DATE_PREF, "") != today()) {
+            preferences.edit().putString(CHECKIN_DATE_PREF, today()).apply()
+            checkIn(showError = false)
+        }
+        return albumList(apiUrl("categories/filter", "page" to "$page", "c" to "0", "o" to "mv"))
+    }
+
+    override suspend fun getLatestUpdates(page: Int): MangasPage = albumList(apiUrl("categories/filter", "page" to "$page", "c" to "0", "o" to "mr"))
+
+    private suspend fun albumList(url: HttpUrl): MangasPage {
+        val list = apiGet<AlbumListDto>(url)
+        val mangas = list.content.map { it.toSManga(coverHost) }.filterGenre()
+        return MangasPage(mangas, list.content.size >= PAGE_SIZE)
+    }
+
+    // The site's own image CDN: its cover urls stay the same, unlike the API's rotating image hosts
+    private val coverHost get() = "https://cdn-msp.${baseUrl.toHttpUrl().host}"
 
     private fun List<SManga>.filterGenre(): List<SManga> {
-        val removedGenres = preferences.getString(BLOCK_PREF, "")!!.substringBefore("//").trim()
-        if (removedGenres.isEmpty()) return this
-        val removedList = removedGenres.lowercase().split(' ')
-        return this.filterNot { manga ->
-            manga.genre.orEmpty().lowercase().split(", ").any { removedList.contains(it) }
+        val removedGenres = preferences.blockList
+        if (removedGenres.all { it.isBlank() }) return this
+        return filterNot { manga ->
+            manga.genre.orEmpty().lowercase().split(", ").any { it in removedGenres }
         }
     }
 
-    private fun popularMangaFromElement(element: Element): SManga = SManga.create().apply {
-        val children = element.children()
-        if (children.isNotEmpty() && children[0].tagName() == "a") children.removeAt(0)
-        if (children.size >= 4) {
-            title = children[1].text()
-            children[0].selectFirst("a")?.attr("href")?.let { setUrlWithoutDomain(it) }
-            val img = children[0].selectFirst("img")
-            if (img != null) {
-                thumbnail_url = img.extractThumbnailUrl().substringBeforeLast('?')
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
+        if (filters.firstInstanceOrNull<FavoritesFilter>()?.isEnabled() == true) {
+            return fetchFavorites(page)
+        }
+
+        // JM id search: JM123 or 123 opens the album
+        val hasIdPrefix = query.startsWith(PREFIX_ID_SEARCH, ignoreCase = true)
+        if (hasIdPrefix || (query.isNotEmpty() && query.all(Char::isDigit))) {
+            val id = (if (hasIdPrefix) query.substring(PREFIX_ID_SEARCH.length) else query).removePrefix(":").trim()
+            return MangasPage(listOfNotNull(fetchAlbum(id)), hasNextPage = false)
+        }
+
+        // The API's search: "A +B" is A and B, "A B" is A or B, "-A" leaves out A
+        val keywords = listOfNotNull(query.takeIf { it.isNotBlank() }) +
+            filters.filterIsInstance<TagFilter>().map { it.value }.filter { it.isNotEmpty() }
+        val sort = filters.firstInstance<SortFilter>().value
+
+        if (keywords.isEmpty()) {
+            val time = filters.firstInstance<TimeFilter>().value
+            val order = if (sort == "mv" && time.isNotEmpty()) "mv_$time" else sort
+            val category = filters.firstInstanceOrNull<CategoryFilter>()?.value ?: "0"
+            return albumList(apiUrl("categories/filter", "page" to "$page", "c" to category, "o" to order))
+        }
+
+        val url = apiUrl(
+            "search",
+            "search_query" to keywords.joinToString(" +"),
+            "o" to sort,
+            "search_type" to filters.firstInstance<TypeFilter>().value,
+            "page" to "$page",
+        )
+        val list = apiGet<AlbumListDto>(url)
+        list.redirectAid?.let { return MangasPage(listOfNotNull(fetchAlbum(it.toString())), hasNextPage = false) }
+        return MangasPage(list.content.map { it.toSManga(coverHost) }.filterGenre(), list.content.size >= PAGE_SIZE)
+    }
+
+    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
+        if (url.host !in MIRROR_HOSTS) return null
+        if (url.pathSegments.firstOrNull() !in listOf("album", "photo")) return null
+        return fetchAlbum(url.pathSegments.getOrNull(1) ?: return null)
+    }
+
+    // A chapter id (from /photo/ links too) answers with its album's id in series_id
+    private suspend fun fetchAlbum(id: String): SManga? {
+        val album = album(id) ?: return null
+        if (album.seriesId != "0" && album.seriesId != id) {
+            return album(album.seriesId)?.toSManga(coverHost)
+        }
+        return album.toSManga(coverHost)
+    }
+
+    // Unknown ids answer an empty array
+    private suspend fun album(id: String): AlbumDto? = apiGet<JsonElement>(apiUrl("album", "id" to id))
+        .takeIf { it is JsonObject }
+        ?.parseAs<AlbumDto>()
+
+    private suspend fun album(manga: SManga): AlbumDto = album(manga.albumId()) ?: throw Exception("作品不存在")
+
+    private fun SManga.albumId() = url.split('/')[2]
+
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
+        val album = album(manga)
+        val updatedManga = album.toSManga(coverHost).apply { url = manga.url }
+        return SMangaUpdate(updatedManga, album.toSChapterList())
+    }
+
+    override suspend fun fetchRelatedMangaList(manga: SManga): List<SManga> = album(manga).relatedList.map { it.toSManga(coverHost) }
+
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val chapterId = chapter.url.split('/')[2]
+        // A removed chapter answers an empty array
+        val data = apiGet<JsonElement>(apiUrl("comic_read", "id" to chapterId, "express" to ""))
+        if (data !is JsonObject) return emptyList()
+        return data.parseAs<ChapterImagesDto>().images.mapIndexed { index, image -> Page(index, imageUrl = image.image) }
+    }
+
+    private suspend fun fetchFavorites(page: Int): MangasPage {
+        val url = apiUrl("favorite", "page" to "$page", "folder_id" to "0", "o" to "mr")
+        val favorites = withLogin { apiGet<FavoriteListDto>(url, it.jwttoken) }
+        return MangasPage(
+            favorites.list.map { it.toSManga(coverHost) },
+            hasNextPage = page * FAVORITES_PAGE_SIZE < favorites.total.toInt(),
+        )
+    }
+
+    override val supportsFilterFetching get() = true
+
+    override suspend fun fetchFilterData(): JsonElement {
+        val data = apiGet<CategoriesDto>(apiUrl("categories"))
+        val categories = data.categories.flatMap { group ->
+            val slug = group.slug.ifEmpty { "0" }
+            listOf(group.name to slug) + group.subCategories.orEmpty().map { "${group.name} · ${it.name}" to "${slug}_${it.slug}" }
+        }
+        return FilterData(categories, data.blocks.map { it.title to it.content }).toJsonElement()
+    }
+
+    override fun getFilterList(data: JsonElement?): FilterList {
+        val filterData = data?.parseAs<FilterData>()
+        return FilterList(
+            buildList {
+                add(FavoritesFilter())
+                add(Filter.Separator())
+                add(Filter.Header("搜索或选择标签时不按类型和时间筛选"))
+                filterData?.let { add(CategoryFilter(it.categories)) }
+                filterData?.tagGroups?.forEach { (name, tags) -> add(TagFilter(name, tags)) }
+                add(SortFilter())
+                add(Filter.Header("时间只用于最多浏览"))
+                add(TimeFilter())
+                add(TypeFilter())
+            },
+        )
+    }
+
+    private val hostMutex = Mutex()
+
+    @Volatile private var apiHost: String? = null
+
+    private suspend fun apiHost(): String = apiHost ?: hostMutex.withLock {
+        apiHost ?: fetchServers().random().also { apiHost = it }
+    }
+
+    // An API host that stops answering is picked again from the list on the next request
+    private fun dropFailedApiHost(chain: Interceptor.Chain): Response = try {
+        chain.proceed(chain.request())
+    } catch (e: IOException) {
+        if (!chain.call().isCanceled() && chain.request().url.host == apiHost) apiHost = null
+        throw e
+    }
+
+    // The app's server list, or a snapshot of it when the list fails
+    private suspend fun fetchServers(): List<String> = try {
+        val text = client.get(SERVER_LIST_URL, Fetch.XHR).body.string().trimStart('\uFEFF')
+        decrypt(text, SERVER_LIST_SECRET).parseAs<ServerListDto>().server
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Exception) {
+        FALLBACK_SERVERS
+    }
+
+    private suspend fun apiUrl(path: String, vararg params: Pair<String, String>): HttpUrl = HttpUrl.Builder()
+        .scheme("https")
+        .host(apiHost())
+        .addPathSegments(path)
+        .apply {
+            params.forEach { (name, value) -> addQueryParameter(name, value) }
+            addQueryParameter("lang", "CN")
+        }
+        .build()
+
+    private fun apiHeaders(timestamp: String, token: String?): Headers = headers.newBuilder()
+        .set("Token", "$timestamp$TOKEN_SECRET".md5().toHexString())
+        .set("Tokenparam", "$timestamp,$APP_VERSION")
+        .apply { if (token != null) set("Authorization", "Bearer $token") }
+        .build()
+
+    private suspend inline fun <reified T> apiGet(url: HttpUrl, token: String? = null): T {
+        val timestamp = timestamp()
+        return client.get(url, apiHeaders(timestamp, token), Fetch.XHR).decode(timestamp)
+    }
+
+    private suspend inline fun <reified T> apiPost(url: HttpUrl, body: RequestBody, token: String? = null, ensureSuccess: Boolean = true): T {
+        val timestamp = timestamp()
+        return client.post(url, apiHeaders(timestamp, token), Fetch.XHR, body, ensureSuccess).decode(timestamp)
+    }
+
+    // The API sometimes answers 200 with a plain-text server error
+    private inline fun <reified T> Response.decode(timestamp: String): T {
+        val body = try {
+            parseAs<ApiResponse>()
+        } catch (_: SerializationException) {
+            throw Exception("禁漫服务器异常，请稍后重试")
+        }
+        if (body.code != 200) throw body.errorMsg?.let(::Exception) ?: HttpException(body.code)
+        val data = body.data!!
+        val json = if (data is JsonPrimitive && data.isString) decrypt(data.content, "$timestamp$TOKEN_SECRET").parseAs<JsonElement>() else data
+        return json.parseAs<T>()
+    }
+
+    private fun decrypt(data: String, secret: String): String = Base64.decode(data, Base64.DEFAULT)
+        .aesDecrypt(aesEcb(secret.md5().toHexString().encodeToByteArray()))
+        .decodeToString()
+
+    private fun timestamp() = Clock.System.now().epochSeconds.toString()
+
+    private val loginMutex = Mutex()
+
+    // The API keeps the login in its AVS cookie
+    @Volatile private var session: Session? = null
+
+    private class Session(val credentials: Pair<String, String>, val member: MemberDto)
+
+    private suspend fun member(expired: MemberDto? = null): MemberDto {
+        val credentials = preferences.credentials ?: throw Exception("请在插件设置中填写用户名和密码")
+        return loginMutex.withLock {
+            session?.takeIf { it.credentials == credentials && it.member !== expired }?.member
+                ?: login(credentials).also { session = Session(credentials, it) }
+        }
+    }
+
+    // A failed login answers 401 with the reason in errorMsg
+    private suspend fun login(credentials: Pair<String, String>): MemberDto {
+        val body = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart("username", credentials.first)
+            .addFormDataPart("password", credentials.second)
+            .build()
+        return apiPost(apiUrl("login"), body, ensureSuccess = false)
+    }
+
+    // A session the server has ended answers 401: log in again once
+    private suspend inline fun <reified T> withLogin(call: (MemberDto) -> T): T {
+        val member = member()
+        return try {
+            call(member)
+        } catch (e: HttpException) {
+            if (e.code != 401) throw e
+            call(member(expired = member))
+        }
+    }
+
+    private fun checkIn(showError: Boolean) {
+        @OptIn(DelicateCoroutinesApi::class)
+        GlobalScope.launch(Dispatchers.IO) {
+            try {
+                val msg = performCheckIn()
+                preferences.edit().putString(CHECKIN_DATE_PREF, today()).apply()
+                showToast("签到：$msg")
+            } catch (e: Exception) {
+                if (showError) showToast("签到失败：${e.message}")
             }
-            author = children[2].select("a").joinToString(", ") { it.text() }
-            genre = children[3].select("a").joinToString(", ") { it.text() }
         }
     }
 
-    // 最新排序
-    override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/albums?o=mr&page=$page", headers)
-
-    override fun latestUpdatesParse(response: Response): MangasPage = popularMangaParse(response)
-
-    // For JinmantiantangUrlActivity
-    private fun searchMangaByIdRequest(id: String) = GET("$baseUrl/album/$id", headers)
-
-    private fun searchMangaByIdParse(response: Response, id: String): MangasPage {
-        val sManga = mangaDetailsParse(response)
-        sManga.url = "/album/$id/"
-        return MangasPage(listOf(sManga), false)
+    private suspend fun performCheckIn(): String = withLogin { member ->
+        val daily = apiGet<DailyDto>(apiUrl("daily", "user_id" to member.uid), member.jwttoken)
+        val body = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart("user_id", member.uid)
+            .addFormDataPart("daily_id", daily.dailyId.toString())
+            .build()
+        apiPost<MessageDto>(apiUrl("daily_chk"), body, member.jwttoken).msg
     }
 
-    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
-        if (query.startsWith("https://")) {
-            val url = query.toHttpUrl()
-            if (url.host != baseUrl.toHttpUrl().host) {
-                throw Exception("Unsupported url")
-            }
-            val titleid = url.pathSegments[1]
-            return fetchSearchManga(page, "$PREFIX_ID_SEARCH$titleid", filters)
-        }
-        return if (query.startsWith(PREFIX_ID_SEARCH_NO_COLON, true) || query.toIntOrNull() != null) {
-            val id = query.removePrefix(PREFIX_ID_SEARCH_NO_COLON).removePrefix(":")
-            client.newCall(searchMangaByIdRequest(id))
-                .asObservableSuccess()
-                .map { response -> searchMangaByIdParse(response, id) }
-        } else {
-            super.fetchSearchManga(page, query, filters)
+    private fun showToast(message: String) {
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(applicationContext, message, Toast.LENGTH_LONG).show()
         }
     }
 
-    // 查询信息
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        var params = filters.filterIsInstance<UriPartFilter>().joinToString("") { it.toUriPart() }
-
-        val url = if (query.isNotEmpty() && !query.contains("-")) {
-            // 禁漫天堂特有搜索方式: A +B --> A and B, A B --> A or B
-            var newQuery = query.replace("+", "%2B").replace(" ", "+")
-            // remove illegal param
-            params = params.substringAfter("?")
-            if (params.contains("search_query")) {
-                val keyword = params.substringBefore("&").substringAfter("=")
-                newQuery = "$newQuery+%2B$keyword"
-                params = params.substringAfter("&")
-            }
-            "$baseUrl/search/photos?search_query=$newQuery&page=$page&$params"
-        } else {
-            params = if (params.isEmpty()) "/albums?" else params
-            if (query.isEmpty()) {
-                "$baseUrl$params&page=$page"
-            } else {
-                // 在搜索栏的关键词前添加-号来实现对筛选结果的过滤, 像 "-YAOI -扶他 -毛絨絨 -獵奇", 注意此时搜索功能不可用.
-                val removedGenres = query.split(" ").filter { it.startsWith("-") }.joinToString("+") { it.removePrefix("-") }
-                "$baseUrl$params&page=$page&screen=$removedGenres"
-            }
-        }
-        return GET(url, headers)
-    }
-
-    override fun searchMangaParse(response: Response): MangasPage = popularMangaParse(response)
-
-    // 漫画详情
-    private fun mangaDetailsResolve(response: Response): Document {
-        val document = response.asJsoup()
-        val scripts =
-            document.select("#wrapper > script:containsData(function base64DecodeUtf8):containsData(document.write(html))")
-
-        for (script in scripts) {
-            val jsCode = script.html().trim()
-
-            jsCode.lines().forEach { line ->
-                val trimmedLine = line.trim()
-                // html = base64DecodeUtf8("...")
-                if (trimmedLine.startsWith("const html") || trimmedLine.startsWith("let html") || trimmedLine.startsWith(
-                        "var html",
-                    )
-                ) {
-                    val start =
-                        trimmedLine.indexOf("base64DecodeUtf8(\"") + "base64DecodeUtf8(\"".length
-                    val end = trimmedLine.indexOf("\");", start)
-                    if (start > 0 && end > start) {
-                        val html = Base64.decode(trimmedLine.substring(start, end), Base64.DEFAULT)
-                        document.body().append(String(html))
-                    }
-                }
-            }
-        }
-        return document
-    }
-
-    override fun mangaDetailsParse(response: Response): SManga {
-        val document = mangaDetailsResolve(response)
-        return mangaDetailsParse(document)
-    }
-
-    private fun mangaDetailsParse(document: Document): SManga = SManga.create().apply {
-        title = document.selectFirst("h1")?.text() ?: ""
-        // keep thumbnail_url same as the one in popularMangaFromElement()
-        val img = document.selectFirst(".thumb-overlay > img")
-        thumbnail_url = img?.extractThumbnailUrl()?.substringBeforeLast('.') + "_3x4.jpg"
-        author = selectAuthor(document)
-        genre = selectDetailsStatusAndGenre(document, 0).trim().split(" ").joinToString(", ")
-
-        // When the index passed by the "selectDetailsStatusAndGenre(document: Document, index: Int)" index is 1,
-        // it will definitely return a String type of 0, 1 or 2. This warning can be ignored
-        status = selectDetailsStatusAndGenre(document, 1).trim().toIntOrNull() ?: 0
-        description = document.selectFirst("#intro-block .p-t-5.p-b-5")?.text()?.substringAfter("敘述：")?.trim() ?: ""
-    }
-
-    override fun getMangaUrl(manga: SManga) = "$baseUrl${manga.url}"
-
-    private fun Element.extractThumbnailUrl(): String = when {
-        hasAttr("data-original") -> attr("data-original")
-        hasAttr("src") -> attr("src")
-        hasAttr("data-cfsrc") -> attr("data-cfsrc")
-        else -> ""
-    }
-
-    // 查询作者信息
-    private fun selectAuthor(document: Document): String {
-        val elements = document.select("div.panel-body div.tag-block")
-        if (elements.size > 3) {
-            return elements[3].select(".btn-primary").joinToString { it.text() }
-        }
-        return ""
-    }
-
-    // 查询漫画状态和类别信息
-    private fun selectDetailsStatusAndGenre(document: Document, index: Int): String {
-        var status = "0"
-        var genre = ""
-        val spanGenres = document.select("span[itemprop=genre] a")
-        if (spanGenres.isEmpty()) {
-            return if (index == 1) status else genre
-        }
-        val elements: Elements = document.selectFirst("span[itemprop=genre]")?.select("a") ?: return ""
-        for (value in elements) {
-            when (val vote: String = value.select("a").text()) {
-                "連載中" -> status = "1"
-                "完結" -> status = "2"
-                else -> genre = "$genre$vote "
-            }
-        }
-        return if (index == 1) status else genre
-    }
-
-    private val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.ENGLISH)
-
-    private fun chapterFromElement(element: Element): SChapter = SChapter.create().apply {
-        url = element.selectFirst("a")?.attr("href") ?: ""
-        name = element.selectFirst("a li h3")?.ownText() ?: ""
-        date_upload = dateFormat.tryParse(element.selectFirst("a li span.hidden-xs")?.text())
-    }
-
-    override fun chapterListParse(response: Response): List<SChapter> {
-        val document = mangaDetailsResolve(response)
-        val elements = document.select("div[id=episode-block] a[href^=/photo/]")
-        if (elements.isEmpty()) {
-            val singleChapter = SChapter.create().apply {
-                name = "单章节"
-                url = document.selectFirst("#album_photo_cover > div.thumb-overlay > a")?.attr("href") ?: ""
-                date_upload = dateFormat.tryParse(document.select("[itemprop=datePublished]").last()?.attr("content"))
-            }
-            return listOf(singleChapter)
-        }
-        return elements.map { chapterFromElement(it) }.reversed()
-    }
-
-    // 漫画图片信息
-    override fun pageListParse(response: Response): List<Page> {
-        tailrec fun internalParse(document: Document, pages: MutableList<Page>): List<Page> {
-            val elements = document.select("div[class=center scramble-page spnotice_chk][id*=0]")
-            for (element in elements) {
-                val img = element.selectFirst("img") ?: continue
-                val src = img.attr("src")
-                val dataCfsrc = img.attr("data-cfsrc")
-                val imageUrl = if (src.contains("blank.jpg") || dataCfsrc.contains("blank.jpg")) {
-                    img.attr("data-original").substringBefore("?")
-                } else {
-                    src.substringBefore("?")
-                }
-                pages.add(Page(pages.size, imageUrl = imageUrl))
-            }
-            val next = document.selectFirst("a.prevnext")
-            return if (next == null) {
-                pages
-            } else {
-                internalParse(client.newCall(GET(next.attr("abs:href"), headers)).execute().asJsoup(), pages)
-            }
-        }
-
-        return internalParse(response.asJsoup(), mutableListOf())
-    }
-
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
-
-    // Filters
-    override fun getFilterList() = FilterList(
-        CategoryGroup(),
-        SortFilter(),
-        TimeFilter(),
-        TypeFilter(),
-    )
+    private fun today(): String = LocalDate.now().toString()
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        getPreferenceList(screen.context, preferences, updateUrlInterceptor.isUpdated).forEach(screen::addPreference)
-        screen.addRandomUAPreference()
+        val context = screen.context
+
+        EditTextPreference(context).apply {
+            key = USERNAME_PREF
+            title = "用户名"
+            summary = "填写用户名和密码后可使用收藏夹和签到"
+            setDefaultValue("")
+        }.let(screen::addPreference)
+
+        EditTextPreference(context).apply {
+            key = PASSWORD_PREF
+            title = "密码"
+            summary = if (preferences.getString(key, "").isNullOrEmpty()) "未设置" else "已设置"
+            dialogTitle = title
+            setOnBindEditTextListener {
+                it.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            }
+            setOnPreferenceChangeListener { pref, newValue ->
+                (pref as EditTextPreference).summary = if ((newValue as String).isEmpty()) "未设置" else "已设置"
+                true
+            }
+        }.let(screen::addPreference)
+
+        SwitchPreferenceCompat(context).apply {
+            key = CHECKIN_PREF
+            title = "自动签到"
+            summary = "每天第一次打开热门时自动签到"
+            setDefaultValue(false)
+        }.let(screen::addPreference)
+
+        // A switch that never turns on: the extensions lib has no plain clickable Preference
+        SwitchPreferenceCompat(context).apply {
+            title = "立即签到"
+            summary = "点击立即签到一次"
+            setOnPreferenceChangeListener { _, _ ->
+                checkIn(showError = true)
+                false
+            }
+        }.let(screen::addPreference)
+
+        EditTextPreference(context).apply {
+            key = BLOCK_PREF
+            title = "屏蔽词列表"
+            setDefaultValue(
+                "// 例如 \"YAOI cos 扶他 毛絨絨 獵奇 韩漫 韓漫\", " +
+                    "关键词之间用空格分离, 大小写不敏感, \"//\"后的字符会被忽略",
+            )
+            dialogTitle = "关键词列表"
+        }.let(screen::addPreference)
     }
 
     companion object {
-        private const val PREFIX_ID_SEARCH_NO_COLON = "JM"
-        const val PREFIX_ID_SEARCH = "$PREFIX_ID_SEARCH_NO_COLON:"
+        private const val PREFIX_ID_SEARCH = "JM"
+        private const val PAGE_SIZE = 80
+        private const val FAVORITES_PAGE_SIZE = 20
+
+        // The mirrors in build.gradle.kts, all deep linked
+        private val MIRROR_HOSTS = setOf("18comic.vip", "18comic.ink", "jmcomic-zzz.one", "jmcomic-zzz.org")
+
+        private const val APP_VERSION = "2.1.12"
+        private const val TOKEN_SECRET = "185Hcomic3PAPP7R"
+        private const val SERVER_LIST_URL = "https://rup4a04-c02.tos-cn-hongkong.bytepluses.com/newsvr-2025.txt"
+        private const val SERVER_LIST_SECRET = "diosfjckwpqpdfjkvnqQjsik"
+
+        // The server list on 2026-10-28
+        private val FALLBACK_SERVERS = listOf(
+            "www.cdnhjk.net",
+            "www.cdnutc.cc",
+            "www.cdngwc.net",
+            "www.cdngwc.club",
+        )
     }
 }

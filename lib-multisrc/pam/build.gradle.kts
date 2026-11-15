@@ -3,10 +3,14 @@ plugins {
 }
 
 dependencies {
-    api(project(":lib:secretstream"))
+    api(project(":lib:i18n"))
 }
 
 keiyoushi {
-    baseVersionCode = 2
-    libVersion = "1.4"
+    baseVersionCode = 6
+    libVersion = "1.6"
+
+    deeplink {
+        path("/serie/..*")
+    }
 }

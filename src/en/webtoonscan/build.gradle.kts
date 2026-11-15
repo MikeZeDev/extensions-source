@@ -6,13 +6,13 @@ plugins {
 
 keiyoushi {
     name = "WebtoonScan"
-    versionCode = 0
-    contentWarning = ContentWarning.MIXED
-    libVersion = "1.4"
+    versionCode = 1
+    contentWarning = ContentWarning.NSFW
+    libVersion = "1.6"
     theme = "madara"
 
     source {
         lang = "en"
-        baseUrl = "https://webtoonscan.com"
+        baseUrl = "https://webtoonscan.org"
     }
 }

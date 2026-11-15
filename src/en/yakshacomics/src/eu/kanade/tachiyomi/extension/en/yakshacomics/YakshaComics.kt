@@ -5,23 +5,20 @@ import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import keiyoushi.annotation.Source
 import keiyoushi.network.rateLimit
+import keiyoushi.utils.sha256
 import okhttp3.FormBody
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Response
 import java.io.IOException
-import java.security.MessageDigest
 
 @Source
 abstract class YakshaComics : Madara() {
-    override val useNewChapterEndpoint = true
-
     // Adapted from src/en/yakshascans
-    override val client: OkHttpClient = super.client.newBuilder()
-        .addInterceptor(::jsChallengeInterceptor)
-        .rateLimit(1)
-        .build()
-
+    override fun OkHttpClient.Builder.configureClient() = apply {
+        addInterceptor(::jsChallengeInterceptor)
+        rateLimit(1)
+    }
     private fun jsChallengeInterceptor(chain: Interceptor.Chain): Response {
         val response = chain.proceed(chain.request())
         if (response.code != 403) {
@@ -30,12 +27,12 @@ abstract class YakshaComics : Madara() {
         response.close()
 
         Thread.sleep(3000L)
-        val token = fetchToken(chain).sha256()
+        val token = fetchToken(chain).sha256().toHexString()
         val body = FormBody.Builder()
             .add("challenge", token)
             .build()
 
-        val validateResponse = chain.proceed(POST("$baseUrl/hcdn-cgi/jschallenge-validate", headers, body))
+        val validateResponse = chain.proceed(POST("$baseUrl/hcdn-cgi/jschallenge-validate", headers.newBuilder().set("Origin", baseUrl).build(), body))
         validateResponse.use {
             if (!it.isSuccessful) {
                 throw IOException("Failed to bypass js challenge!")
@@ -58,14 +55,6 @@ abstract class YakshaComics : Madara() {
             fetchToken(chain, attempt + 1)
         }
     }
-
-    private fun String.sha256(): String = MessageDigest
-        .getInstance("SHA-256")
-        .digest(toByteArray())
-        .fold("", { str, it -> str + "%02x".format(it) })
-
-    override val mangaDetailsSelectorDescription: String =
-        "div.description-summary div.summary__content h3 + p, div.description-summary div.summary__content:not(:has(h3)), div.summary_content div.post-content_item > h5 + div, div.summary_content div.manga-excerpt"
 
     companion object {
         private const val MAX_ATTEMPT = 5

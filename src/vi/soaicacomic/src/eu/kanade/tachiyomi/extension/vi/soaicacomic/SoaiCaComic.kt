@@ -7,16 +7,20 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
-import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
 import keiyoushi.network.get
 import keiyoushi.network.post
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
+import keiyoushi.utils.asJsoup
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonElement
+import keiyoushi.utils.tryParseDate
+import keiyoushi.utils.ui.askPassword
 import kotlinx.serialization.json.JsonElement
+import okhttp3.CacheControl
 import okhttp3.FormBody
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -24,16 +28,15 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Response
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
 @Source
 abstract class SoaiCaComic : KeiSource() {
-
     private val thumbnailFallbackInterceptor = Interceptor { chain ->
         val request = chain.request()
         val response = chain.proceed(request)
@@ -58,7 +61,7 @@ abstract class SoaiCaComic : KeiSource() {
     // ============================== Popular ===============================
 
     override suspend fun getPopularManga(page: Int): MangasPage {
-        val mangas = client.get("$baseUrl/xem-nhieu-nhat/").asJsoup()
+        val mangas = client.get("$baseUrl/xem-nhieu-nhat/", Fetch.DOCUMENT).asJsoup()
             .select("ul.most-views.single-list-comic li.position-relative")
             .mapNotNull(::archiveMangaFromElement)
 
@@ -69,7 +72,7 @@ abstract class SoaiCaComic : KeiSource() {
 
     override suspend fun getLatestUpdates(page: Int): MangasPage {
         val url = if (page == 1) baseUrl else "$baseUrl/page/$page/"
-        val document = client.get(url).asJsoup()
+        val document = client.get(url, Fetch.DOCUMENT).asJsoup()
         val mangas = document.select(".col-md-3.col-xs-6.comic-item")
             .mapNotNull(::latestMangaFromElement)
         val hasNextPage = document.selectFirst("ul.pager li.next:not(.disabled) a") != null
@@ -104,7 +107,7 @@ abstract class SoaiCaComic : KeiSource() {
                 .add("action", "searchtax")
                 .add("keyword", query)
                 .build()
-            return parseSearchResponse(client.post("$baseUrl/wp-admin/admin-ajax.php", formBody))
+            return parseSearchResponse(client.post("$baseUrl/wp-admin/admin-ajax.php", Fetch.DOCUMENT, formBody))
         }
 
         val filterPath = selectedFilterPath(filters)
@@ -112,7 +115,7 @@ abstract class SoaiCaComic : KeiSource() {
             val url = "$baseUrl/$filterPath/".toHttpUrl().newBuilder()
                 .addQueryParameter("page", page.toString())
                 .build()
-            return parseSearchResponse(client.get(url))
+            return parseSearchResponse(client.get(url, Fetch.DOCUMENT))
         }
 
         return getLatestUpdates(page)
@@ -224,7 +227,7 @@ abstract class SoaiCaComic : KeiSource() {
         val mangaPath = if (url.pathSegments.firstOrNull() == "truyen-tranh") {
             url.encodedPath
         } else {
-            client.get(url).asJsoup()
+            client.get(url, Fetch.DOCUMENT).asJsoup()
                 .selectFirst("#post-category-link, .credit-title a[href*=/truyen-tranh/]")
                 ?.absUrl("href")
                 ?.toHttpUrlOrNull()
@@ -241,7 +244,7 @@ abstract class SoaiCaComic : KeiSource() {
         fetchDetails: Boolean,
         fetchChapters: Boolean,
     ): SMangaUpdate {
-        val document = client.get("$baseUrl${manga.url}").asJsoup()
+        val document = client.get("$baseUrl${manga.url}", Fetch.DOCUMENT).asJsoup()
         return SMangaUpdate(
             manga = parseMangaDetails(document, manga),
             chapters = parseChapterList(document),
@@ -325,22 +328,45 @@ abstract class SoaiCaComic : KeiSource() {
             .ifEmpty { rawName }
     }
 
-    private fun parseChapterDate(dateText: String): Long = runCatching {
-        LocalDate.parse(dateText, dateFormat)
-            .atStartOfDay(dateZone)
-            .toInstant()
-            .toEpochMilli()
-    }.getOrDefault(0L)
+    private fun parseChapterDate(dateText: String): Long = dateFormat.tryParseDate(dateText, dateZone)
 
     // ============================== Pages =================================
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
-        val (html, chapterUrl) = client.get("$baseUrl${chapter.url}").use { response ->
-            response.body.string() to response.request.url.toString()
-        }
+        val chapterUrl = getChapterUrl(chapter)
+        // Locked pages are cacheable (max-age, no Vary: Cookie) — skip disk cache.
+        val response = client.get(chapterUrl, Fetch.DOCUMENT, CacheControl.FORCE_NETWORK)
+        var html = response.body.string()
+        var document = Jsoup.parse(html, chapterUrl)
 
-        if (passwordFieldRegex.containsMatchIn(html)) {
-            throw Exception(passwordWebviewMessage)
+        val lockForm = document.selectFirst("form.post-password-form")
+        if (lockForm != null) {
+            val password = askPassword(
+                title = chapter.name,
+                message = "Chương này yêu cầu mật khẩu",
+                hint = "Mật khẩu",
+            ) ?: throw Exception("Đã hủy nhập mật khẩu")
+
+            val postAction = lockForm.absUrl("action").ifEmpty {
+                "$baseUrl/wp-login.php?action=postpass"
+            }
+            val formBody = FormBody.Builder()
+                .add("post_password", password)
+                .add("redirect_to", chapterUrl)
+                .add("Submit", "Nhập")
+                .build()
+
+            val postHeaders = headers.newBuilder()
+                .set("Referer", chapterUrl)
+                .build()
+
+            client.post(postAction, postHeaders, Fetch.DOCUMENT, formBody, ensureSuccess = false).close()
+            html = client.get(chapterUrl, Fetch.DOCUMENT, CacheControl.FORCE_NETWORK).body.string()
+
+            document = Jsoup.parse(html, chapterUrl)
+            if (document.selectFirst("form.post-password-form") != null) {
+                throw Exception("Mật khẩu không chính xác")
+            }
         }
 
         val imageUrls = ImageDecryptor.extractImageUrls(html, chapterUrl)
@@ -358,7 +384,7 @@ abstract class SoaiCaComic : KeiSource() {
     override val supportsFilterFetching get() = true
 
     override suspend fun fetchFilterData(): JsonElement {
-        val document = client.get(baseUrl).asJsoup()
+        val document = client.get(baseUrl, Fetch.DOCUMENT).asJsoup()
         return FilterData(
             genres = parseFilterOptions(document, "#nav-tags"),
             teams = parseFilterOptions(document, "#nav-teams"),
@@ -394,7 +420,5 @@ abstract class SoaiCaComic : KeiSource() {
     private val chapterNameRegex = Regex("chap\\s*\\d+(?:\\.\\d+)?", RegexOption.IGNORE_CASE)
     private val chapterWordRegex = Regex("chap", RegexOption.IGNORE_CASE)
     private val multiSpaceRegex = Regex("\\s+")
-    private val passwordFieldRegex = Regex("name=\\\"post_password\\\"|name=post_password")
     private val thumbnailFallbackFragmentPrefix = "fallback-url:"
-    private val passwordWebviewMessage = "Vui lòng nhập mật khẩu của chương này qua webview"
 }

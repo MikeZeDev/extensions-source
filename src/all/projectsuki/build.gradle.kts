@@ -6,9 +6,9 @@ plugins {
 
 keiyoushi {
     name = "Project Suki"
-    versionCode = 9
+    versionCode = 2
     contentWarning = ContentWarning.SAFE
-    libVersion = "1.4"
+    libVersion = "1.6"
 
     source {
         lang = "all"
@@ -22,8 +22,4 @@ keiyoushi {
         path("/book/.*")
         path("/read/.*")
     }
-}
-
-dependencies {
-    implementation(project(":lib:randomua"))
 }

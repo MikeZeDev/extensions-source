@@ -8,11 +8,12 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
-import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
 import keiyoushi.network.get
 import keiyoushi.source.KeiSource
-import keiyoushi.utils.long
+import keiyoushi.utils.asJsoup
+import keiyoushi.utils.longOrNull
 import keiyoushi.utils.tryParse
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
@@ -20,6 +21,7 @@ import kotlinx.coroutines.supervisorScope
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Response
@@ -31,11 +33,15 @@ import java.util.Locale
 @Source
 abstract class JComic : KeiSource() {
 
+    override fun Headers.Builder.configureHeaders() = apply {
+        set("Cookie", "jcomic_access=verified_user")
+    }
+
     override fun OkHttpClient.Builder.configureClient() = apply {
         addInterceptor { chain ->
             val origin = chain.request()
             chain.proceed(origin).also {
-                if (it.code == 403 && origin.url.toString().contains("jcomic-content")) {
+                if (it.code == 403 && (origin.url.host.startsWith("images.") || origin.url.toString().contains("jcomic-content"))) {
                     it.close()
                     throw IOException("图片已失效，清除章节缓存后重试\n（链接有效期只有1分钟，建议以后下载完章节再看）")
                 }
@@ -74,10 +80,10 @@ abstract class JComic : KeiSource() {
     }
 
     // Popular
-    override suspend fun getPopularManga(page: Int) = mangaPageParse(client.get("$baseUrl/cat/%E9%9A%A8%E6%A9%9F/$page"))
+    override suspend fun getPopularManga(page: Int) = mangaPageParse(client.get("$baseUrl/cat/%E9%9A%A8%E6%A9%9F/$page", Fetch.DOCUMENT))
 
     // Updates
-    override suspend fun getLatestUpdates(page: Int) = mangaPageParse(client.get("$baseUrl/cat/%E6%9C%80%E8%BF%91%E6%9B%B4%E6%96%B0/$page"))
+    override suspend fun getLatestUpdates(page: Int) = mangaPageParse(client.get("$baseUrl/cat/%E6%9C%80%E8%BF%91%E6%9B%B4%E6%96%B0/$page", Fetch.DOCUMENT))
 
     // Search
     override fun getFilterList(data: JsonElement?) = FilterList(
@@ -106,7 +112,7 @@ abstract class JComic : KeiSource() {
         } else {
             url.addPathSegments("cat/${filters[1]}/$page").build()
         }
-        return mangaPageParse(client.get(finalUrl))
+        return mangaPageParse(client.get(finalUrl, Fetch.DOCUMENT))
     }
 
     // Manga & Chapter
@@ -118,7 +124,7 @@ abstract class JComic : KeiSource() {
     ) = supervisorScope {
         val asyncManga = if (fetchDetails) {
             async {
-                val doc = client.get(baseUrl + manga.url.replace("/page", "/eps")).asJsoup()
+                val doc = client.get(baseUrl + manga.url.replace("/page", "/eps"), Fetch.DOCUMENT).asJsoup()
                 SManga.create().apply {
                     thumbnail_url = doc.selectFirst(".col-md-6:nth-child(1) img")?.absUrl("src")
                 }
@@ -129,7 +135,7 @@ abstract class JComic : KeiSource() {
 
         val asyncChapters = if (fetchChapters) {
             async {
-                val time = manga.memo["time"]!!.long
+                val time = manga.memo["time"]?.longOrNull ?: 0L
                 if (manga.url.contains("/page")) {
                     listOf(
                         SChapter.create().apply {
@@ -139,7 +145,7 @@ abstract class JComic : KeiSource() {
                         },
                     )
                 } else {
-                    val doc = client.get(baseUrl + manga.url).asJsoup()
+                    val doc = client.get(baseUrl + manga.url, Fetch.DOCUMENT).asJsoup()
                     doc.select(".col-md-6:nth-child(2) a").map {
                         SChapter.create().apply {
                             url = it.attr("href")
@@ -158,9 +164,15 @@ abstract class JComic : KeiSource() {
 
     // Page
     override suspend fun getPageList(chapter: SChapter): List<Page> {
-        val response = client.get(baseUrl + chapter.url)
+        val response = client.get(baseUrl + chapter.url, Fetch.DOCUMENT)
         return response.asJsoup().select(".comic-thumb").mapIndexed { i, img ->
-            Page(i, imageUrl = String(Base64.decode(img.attr("data-locked").removePrefix("JCOMIC_TRAP_").reversed(), Base64.NO_WRAP)))
+            val locked = img.attr("data-locked")
+            val url = if (locked.isNotEmpty()) {
+                String(Base64.decode(locked.removePrefix("JCOMIC_TRAP_").reversed(), Base64.NO_WRAP))
+            } else {
+                img.attr("data-src").ifEmpty { img.attr("src") }
+            }
+            Page(i, imageUrl = url)
         }
     }
 }

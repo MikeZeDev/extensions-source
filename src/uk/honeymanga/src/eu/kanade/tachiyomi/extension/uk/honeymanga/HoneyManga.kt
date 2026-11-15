@@ -13,6 +13,7 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
 import keiyoushi.network.get
 import keiyoushi.network.post
 import keiyoushi.network.rateLimit
@@ -62,7 +63,7 @@ abstract class HoneyManga :
                 .addQueryParameter("query", cleanQuery)
                 .build()
 
-            client.get(url).use { response ->
+            client.get(url, Fetch.XHR).use { response ->
                 val blockedGenres = blockGenres()
                 val blockedTypes = blockTypes()
                 val contentShown = contentType()
@@ -129,7 +130,7 @@ abstract class HoneyManga :
             filters = searchFilters.ifEmpty { null },
         ).toJsonRequestBody()
 
-        client.post("$apiUrl/v2/manga/cursor-list", body).use { response ->
+        client.post("$apiUrl/v2/manga/cursor-list", Fetch.XHR, body).use { response ->
             val result = response.parseAs<CatalogResponseDto>()
             val mangas = result.data.mapNotNull { it.toSManga(imgUrl) }
             return MangasPage(mangas, result.hasNextPage)
@@ -171,7 +172,7 @@ abstract class HoneyManga :
         val mangaAsync = async {
             if (fetchDetails) {
                 val url = "$apiUrl/manga/$mangaId"
-                val data = client.get(url).use { it.parseAs<CompleteMangaDto>() }
+                val data = client.get(url, Fetch.XHR).use { it.parseAs<CompleteMangaDto>() }
                 data.toSManga(imgUrl)
             } else {
                 manga
@@ -180,16 +181,25 @@ abstract class HoneyManga :
 
         val chaptersAsync = async {
             if (fetchChapters) {
-                val body = ChapterRequestBody(
-                    mangaId = mangaId,
-                    page = 1,
-                    pageSize = 10000,
-                    sortOrder = "DESC",
-                ).toJsonRequestBody()
+                val fetchedChapters = mutableListOf<SChapter>()
+                var page = 1
                 val chaptersUrl = "$apiUrl/v2/chapter/cursor-list"
-                val data = client.post(chaptersUrl, body).use { it.parseAs<ChapterResponse>().data }
                 val hideLocked = hideLocked()
-                data.mapNotNull { it.toSChapter(hideLocked) }
+
+                do {
+                    val body = ChapterRequestBody(
+                        mangaId = mangaId,
+                        page = page,
+                        pageSize = 1000,
+                        sortOrder = "DESC",
+                    ).toJsonRequestBody()
+
+                    val data = client.post(chaptersUrl, Fetch.XHR, body).parseAs<ChapterResponse>()
+                    fetchedChapters.addAll(data.data.mapNotNull { it.toSChapter(hideLocked) })
+                    page++
+                } while (data.hasNextPage)
+
+                fetchedChapters
             } else {
                 chapters
             }
@@ -214,7 +224,7 @@ abstract class HoneyManga :
             chapter.url
         }
         val url = "$apiUrl/chapter/frames/$chapterId"
-        return client.get(url).use { it.parseAs<ChapterPages>().toPageList(imgUrl) }
+        return client.get(url, Fetch.XHR).use { it.parseAs<ChapterPages>().toPageList(imgUrl) }
     }
 
     // ============================= Filters ==============================

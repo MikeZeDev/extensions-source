@@ -2,8 +2,10 @@ package eu.kanade.tachiyomi.extension.pt.imperiodabritannia
 
 import eu.kanade.tachiyomi.multisrc.mangotheme.MangoTheme
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
+import keiyoushi.network.fetch
+import keiyoushi.utils.asJsoup
 import okhttp3.Headers
 
 @Source
@@ -17,16 +19,16 @@ abstract class ImperioDaBritannia : MangoTheme() {
 
     override val apiUrl = "https://api.${baseUrl.substringAfterLast("/")}/api"
 
-    override fun headersBuilder(): Headers.Builder = super.headersBuilder()
+    override fun Headers.Builder.configureHeaders(): Headers.Builder = addMangoThemeHeaders()
         .set("X-API-Token", apiToken)
         .set("X-Brit-Cache", "true")
         .set("X-Noencryptionbritta", "1")
 
     private val apiToken: String by lazy {
-        val url = client.newCall(GET(baseUrl)).execute().asJsoup()
+        val url = client.newCall(GET(baseUrl).newBuilder().fetch(Fetch.DOCUMENT).build()).execute().asJsoup()
             .selectFirst("link[href*=env]")
             ?.absUrl("href") ?: return@lazy ""
-        API_TOKEN_REGEX.find(client.newCall(GET(url)).execute().body.string())?.groupValues?.last() ?: ""
+        API_TOKEN_REGEX.find(client.newCall(GET(url).newBuilder().fetch(Fetch.SCRIPT).build()).execute().body.string())?.groupValues?.last() ?: ""
     }
 
     override fun getStatusFilterOptions() = ImperioDaBritanniaFilters.statusOptions

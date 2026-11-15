@@ -6,6 +6,8 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
+import keiyoushi.network.fetch
 import keiyoushi.utils.parseAs
 import kotlinx.serialization.Serializable
 import okhttp3.FormBody
@@ -13,12 +15,10 @@ import okhttp3.Request
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import java.text.SimpleDateFormat
-import java.util.Locale
 
 @Source
 abstract class AreaManga : MangaThemesia() {
-    override val dateFormat = SimpleDateFormat("yyyy/MM/dd", Locale("ar"))
+    override val datePattern = "yyyy/MM/dd"
 
     override fun searchMangaSelector() = ".listupd .manga-card-v"
     protected val searchMangaTitleSelector = ".bigor .tt, h3 a"
@@ -57,7 +57,7 @@ abstract class AreaManga : MangaThemesia() {
             .set("Content-Type", "application/x-www-form-urlencoded")
             .build()
 
-        return POST("$baseUrl/wp-admin/admin-ajax.php", newHeaders, formBody)
+        return POST("$baseUrl/wp-admin/admin-ajax.php", newHeaders, formBody).newBuilder().fetch(Fetch.XHR).build()
     }
 
     override fun pageListParse(document: Document): List<Page> {

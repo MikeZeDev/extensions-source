@@ -3,98 +3,61 @@ package eu.kanade.tachiyomi.extension.en.templescan
 import eu.kanade.tachiyomi.source.model.SManga
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
-import java.text.ParseException
-import java.text.SimpleDateFormat
-import java.util.Locale
+
+private val RATING = Regex("""\s*\+18\s*""")
+
+/** What `catalog.js` gets: the statuses to list in turn, the site's order options, and a query for the site search. */
+@Serializable
+class CatalogArgs(
+    private val statuses: List<String>,
+    private val order: String?,
+    private val direction: String?,
+    private val query: String?,
+)
+
+/** What `run.js` reports instead of a script's result. */
+@Serializable
+class PageStatus(
+    val challenge: Boolean = false,
+    val siteCheck: Boolean = false,
+    val status: Int? = null,
+    val error: String? = null,
+)
 
 @Serializable
-class BrowseSeries(
-    @SerialName("series_slug") private val slug: String,
-    val title: String,
-    @SerialName("alternative_names") val alternativeNames: String? = null,
-    private val thumbnail: String? = null,
-    val status: String? = null,
-    @SerialName("update_chapter") private val updatedAt: String? = null,
-    @SerialName("created_at") private val createdAt: String? = null,
-    @SerialName("total_views") val views: Long = 0,
-) {
-    val updated: Long by lazy {
-        dateFormat.tryParse(updatedAt)
-    }
+class TurnstileToken(private val token: String)
 
-    val created: Long by lazy {
-        dateFormat.tryParse(createdAt)
-    }
+/** What `catalog.js` read: the comics page's cards per status, and the site search's results for a query. */
+@Serializable
+class CatalogPage(val cards: List<String>, val results: String? = null)
 
-    fun toSManga() = SManga.create().apply {
-        url = "/comic/$slug"
-        title = this@BrowseSeries.title
-        thumbnail_url = thumbnail
-    }
+@Serializable
+class HtmlPage(val html: String)
+
+@Serializable
+class ReaderPage(val pages: List<String>)
+
+fun String.withoutRating() = replace(RATING, " ").trim().ifEmpty { null }
+
+fun parseStatus(status: String?) = when (status?.lowercase()) {
+    "ongoing" -> SManga.ONGOING
+    "hiatus" -> SManga.ON_HIATUS
+    "completed" -> SManga.COMPLETED
+    "canceled", "dropped" -> SManga.CANCELLED
+    else -> SManga.UNKNOWN
 }
 
+/** schema.org `ComicSeries` JSON-LD block embedded in the detail page. */
 @Serializable
-class SeriesDetails(
-    @SerialName("series_slug") val slug: String,
-    val title: String,
-    val thumbnail: String? = null,
-    val author: String? = null,
-    val studio: String? = null,
-    @SerialName("release_year") val year: String? = null,
-    @SerialName("alternative_names") val alternativeNames: String? = null,
-    val adult: Boolean = false,
-    val badge: String? = null,
-    val status: String? = null,
-    val description: String? = null,
-    @SerialName("tag_series") val tags: List<TagWrapper>? = emptyList(),
-)
-
-@Serializable
-class TagWrapper(
-    val tag: Tag,
-)
-
-@Serializable
-class Tag(
-    val name: String,
-)
-
-@Serializable
-class ChapterList(
-    @SerialName("Season") val seasons: List<Chapters>,
+class ComicSeriesLd(
+    @SerialName("@type") private val type: String? = null,
+    val image: String? = null,
+    val author: Author? = null,
+    val alternateName: String? = null,
+    val genre: List<String>? = null,
 ) {
     @Serializable
-    class Chapters(
-        @SerialName("Chapter") val chapters: List<Chapter>,
-    ) {
-        @Serializable
-        class Chapter(
-            @SerialName("chapter_name") val name: String,
-            @SerialName("chapter_title") val title: String? = null,
-            @SerialName("chapter_slug") val slug: String,
-            val price: Int,
-            @SerialName("created_at") private val createdAt: String? = null,
-        ) {
-            val created: Long by lazy {
-                dateFormat.tryParse(createdAt)
-            }
-        }
-    }
-}
+    class Author(val name: String? = null)
 
-@Serializable
-class PagesList(
-    val pages: List<String>,
-)
-
-private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ENGLISH)
-
-private fun SimpleDateFormat.tryParse(date: String?): Long {
-    date ?: return 0L
-
-    return try {
-        parse(date)?.time ?: 0L
-    } catch (_: ParseException) {
-        0L
-    }
+    val isSeries: Boolean get() = type == "ComicSeries"
 }

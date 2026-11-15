@@ -8,11 +8,11 @@ keiyoushi {
     name = "Soul Scans"
     versionCode = 2
     contentWarning = ContentWarning.SAFE
-    libVersion = "1.4"
-    theme = "mangathemesia"
+    libVersion = "1.6"
+    theme = "loneseal"
 
     source {
+        baseUrl = "https://v1.soulscans.asia"
         lang = "id"
-        baseUrl = "https://soulscans.my.id"
     }
 }

@@ -6,13 +6,13 @@ plugins {
 
 keiyoushi {
     name = "Kuroi Manga"
-    versionCode = 5
+    versionCode = 7
     contentWarning = ContentWarning.NSFW
-    libVersion = "1.4"
+    libVersion = "1.6"
     theme = "madara"
 
     source {
         lang = "tr"
-        baseUrl = "https://www.kuroimanga.best"
+        baseUrl = "https://www.kuroimanga.site"
     }
 }

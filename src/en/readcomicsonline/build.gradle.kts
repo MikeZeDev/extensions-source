@@ -6,9 +6,9 @@ plugins {
 
 keiyoushi {
     name = "Read Comics Online"
-    versionCode = 1
+    versionCode = 2
     contentWarning = ContentWarning.SAFE
-    libVersion = "1.4"
+    libVersion = "1.6"
     theme = "mmrcms"
 
     source {

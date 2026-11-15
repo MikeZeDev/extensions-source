@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.extension.all.yskcomics
 
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
+import keiyoushi.utils.ratingStars
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonNames
@@ -36,22 +37,9 @@ class NamedEntity(
 
 private fun getRatingString(rate: String, rateCount: Int): String {
     val ratingValue = rate.toDoubleOrNull() ?: 0.0
-    val ratingStar = when {
-        ratingValue >= 4.75 -> "★★★★★"
-        ratingValue >= 4.25 -> "★★★★✬"
-        ratingValue >= 3.75 -> "★★★★☆"
-        ratingValue >= 3.25 -> "★★★✬☆"
-        ratingValue >= 2.75 -> "★★★☆☆"
-        ratingValue >= 2.25 -> "★★✬☆☆"
-        ratingValue >= 1.75 -> "★★☆☆☆"
-        ratingValue >= 1.25 -> "★✬☆☆☆"
-        ratingValue >= 0.75 -> "★☆☆☆☆"
-        ratingValue >= 0.25 -> "✬☆☆☆☆"
-        else -> "☆☆☆☆☆"
-    }
     return if (ratingValue > 0.0) {
         buildString {
-            append("$ratingStar $rate")
+            append("${ratingStars(ratingValue, max = 5)} $rate")
             if (rateCount > 0) {
                 append(" ($rateCount)")
             }
@@ -65,14 +53,14 @@ private fun getRatingString(rate: String, rateCount: Int): String {
 
 @Serializable
 class MangaPopularRaw(
-    val image: String,
-    @SerialName("full_name") val fullName: String,
-    val slug: String,
-    val rate: String,
-    val writer: NamedEntity,
-    val publisher: NamedEntity,
-    val genres: List<NamedEntity>,
-    @JsonNames("descrition") val description: String,
+    private val image: String,
+    @SerialName("full_name") private val fullName: String,
+    private val slug: String,
+    private val rate: String,
+    private val writer: NamedEntity,
+    private val publisher: NamedEntity,
+    private val genres: List<NamedEntity>,
+    @JsonNames("descrition") private val description: String,
 ) {
     fun toSManga(lang: String) = SManga.create().apply {
         url = "/$lang/comic/$slug"
@@ -101,13 +89,13 @@ class MangaPopularRaw(
 
 @Serializable
 class MangaLatestRaw(
-    val image: String,
-    @SerialName("full_name") val fullName: String,
-    val slug: String,
-    val rate: String,
-    @SerialName("rate_count") val rateCount: Int,
-    val writer: String,
-    val genres: List<NamedEntity>,
+    private val image: String,
+    @SerialName("full_name") private val fullName: String,
+    private val slug: String,
+    private val rate: String,
+    @SerialName("rate_count") private val rateCount: Int,
+    private val writer: String,
+    private val genres: List<NamedEntity>,
 ) {
     fun toSManga(lang: String) = SManga.create().apply {
         url = "/$lang/comic/$slug"
@@ -128,9 +116,9 @@ class MangaLatestRaw(
 
 @Serializable
 class MangaSearchRaw(
-    @SerialName("full_name") val fullName: String,
-    val slug: String,
-    val image: String,
+    @SerialName("full_name") private val fullName: String,
+    private val slug: String,
+    private val image: String,
 ) {
     fun toSManga(lang: String) = SManga.create().apply {
         url = "/$lang/comic/$slug"
@@ -144,19 +132,19 @@ class MangaSearchRaw(
 
 @Serializable
 class DetailsRaw(
-    @SerialName("full_name") val fullName: String,
-    val slug: String,
-    val image: String,
-    val rate: String,
-    @SerialName("rate_count") val rateCount: Int,
-    @SerialName("language_code") val languageCode: String,
-    val writer: NamedEntity,
-    val publisher: NamedEntity,
-    val genres: List<NamedEntity>,
-    val artists: List<NamedEntity>,
-    val status: String,
-    val description: String,
-    @SerialName("published_at") val publishedAt: String,
+    @SerialName("full_name") private val fullName: String,
+    private val slug: String,
+    private val image: String,
+    private val rate: String,
+    @SerialName("rate_count") private val rateCount: Int,
+    @SerialName("language_code") private val languageCode: String,
+    private val writer: NamedEntity,
+    private val publisher: NamedEntity,
+    private val genres: List<NamedEntity>,
+    private val artists: List<NamedEntity>,
+    private val status: String,
+    private val description: String,
+    @SerialName("published_at") private val publishedAt: String,
 ) {
     fun toSManga(lang: String): SManga = SManga.create().apply {
         url = "/$lang/comic/$slug"
@@ -204,8 +192,8 @@ class DetailsRaw(
 
 @Serializable
 class ChapterRaw(
-    val slug: String,
-    val rank: String,
+    private val slug: String,
+    private val rank: String,
 ) {
     fun toSChapter(lang: String) = SChapter.create().apply {
         url = "/$lang/chapter/$slug"

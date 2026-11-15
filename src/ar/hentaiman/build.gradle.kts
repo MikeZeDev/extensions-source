@@ -8,7 +8,7 @@ keiyoushi {
     name = "HentaiMan"
     versionCode = 1
     contentWarning = ContentWarning.NSFW
-    libVersion = "1.4"
+    libVersion = "1.6"
 
     source {
         lang = "ar"

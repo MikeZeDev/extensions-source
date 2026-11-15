@@ -16,9 +16,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.put
 import org.jsoup.Jsoup
-import java.text.SimpleDateFormat
-import java.util.Locale
-import java.util.TimeZone
+import kotlin.time.Instant
 
 @Serializable
 class GreenShitLoginRequestDto(
@@ -71,7 +69,7 @@ class GreenShitChapterSimpleDto(
         name = locked + this@GreenShitChapterSimpleDto.name
         chapter_number = number ?: 0f
         url = "/capitulo/$id"
-        date_upload = dateFormat.tryParse(createdAt)
+        date_upload = Instant.tryParse(createdAt)
     }
 }
 
@@ -115,6 +113,7 @@ class GreenShitMangaDto(
 class GreenShitPageSrcDto(
     val src: String,
     val mime: String? = null,
+    @SerialName("is_wp") val isWp: Boolean = false,
 )
 
 private object PageListSerializer :
@@ -140,9 +139,15 @@ class GreenShitChapterDetailDto(
     fun toPageList(cdnUrl: String): List<Page> {
         val obraId = manga?.id ?: 0
         val scanId = manga?.scanId ?: 0
-        val chapterNumber = number?.toString()?.removeSuffix(".0") ?: "0"
+        val chapterNumber = number?.toString()?.removeSuffix(".0")?.replace(".", "_") ?: "0"
         return pages.mapIndexed { idx, p ->
-            val imageUrl = buildImageUrl(path = "/scans/$scanId/obras/$obraId/capitulos/$chapterNumber/", src = p.src, mime = p.mime, width = null, base = cdnUrl)
+            val imageUrl = buildImageUrl(
+                path = "/scans/$scanId/obras/$obraId/capitulos/$chapterNumber/",
+                src = p.src,
+                width = null,
+                base = cdnUrl,
+                isWp = p.isWp,
+            )
             Page(idx, imageUrl = imageUrl)
         }
     }
@@ -178,11 +183,13 @@ class GreenShitTagFilterDto(
     fun toPair(): Pair<String, String> = Pair(name, id.toString())
 }
 
+private val md5PathRegex = Regex("^/[0-9a-fA-F]{32}/")
+
 private fun isWpLikePath(src: String): Boolean = src.startsWith("uploads/") ||
     src.startsWith("wp-content/") ||
     src.startsWith("manga_") ||
-    src.startsWith("WP-manga")
-
+    src.startsWith("WP-manga") ||
+    md5PathRegex.containsMatchIn(src)
 private val slashRegex = Regex("(?<!:)/{2,}")
 
 private fun normalizeSlashes(url: String): String = url.replace(slashRegex, "/")
@@ -190,25 +197,22 @@ private fun normalizeSlashes(url: String): String = url.replace(slashRegex, "/")
 fun buildImageUrl(
     path: String = "",
     src: String = "",
-    width: Int?,
+    width: Int? = null,
     base: String,
-    mime: String? = null,
+    isWp: Boolean = false,
 ): String {
     if (src.isBlank()) return ""
     if (src.startsWith("http")) return src
-    if (isWpLikePath(src) || mime != null) {
-        return when {
-            src.startsWith("manga_") -> normalizeSlashes("$base/wp-content/uploads/WP-manga/data/$src")
-            src.startsWith("WP-manga") -> normalizeSlashes("$base/wp-content/uploads/$src")
-            src.startsWith("uploads/") -> normalizeSlashes("$base/wp-content/$src")
-            src.startsWith("wp-content/") -> normalizeSlashes("$base/$src")
-            else -> normalizeSlashes("$base/wp-content/uploads/WP-manga/data/${src.trimStart('/')}")
+    if (isWpLikePath(src) || isWp) {
+        val e = when {
+            src.startsWith("WP-manga") -> "wp-content/uploads/$src"
+            src.startsWith("uploads/") -> "wp-content/$src"
+            src.startsWith("manga_") -> "wp-content/uploads/WP-manga/data/$src"
+            src.startsWith("wp-content/") -> src
+            else -> "wp-content/uploads/WP-manga/data/${src.trimStart('/')}"
         }
+        return normalizeSlashes("$base/$e")
     }
     val query = width?.let { "?width=$it" } ?: ""
     return normalizeSlashes("$base/$path/$src$query")
-}
-
-private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ROOT).apply {
-    timeZone = TimeZone.getTimeZone("UTC")
 }

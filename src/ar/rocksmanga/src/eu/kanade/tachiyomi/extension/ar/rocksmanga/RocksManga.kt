@@ -1,126 +1,132 @@
 package eu.kanade.tachiyomi.extension.ar.rocksmanga
 
-import eu.kanade.tachiyomi.multisrc.madara.Madara
-import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
+import eu.kanade.tachiyomi.source.model.MangasPage
+import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
+import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
+import keiyoushi.network.get
+import keiyoushi.source.KeiSource
+import keiyoushi.utils.asJsoup
+import keiyoushi.utils.extractNextJs
+import keiyoushi.utils.firstInstanceOrNull
+import keiyoushi.utils.parseAs
+import keiyoushi.utils.toJsonElement
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Request
-import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import java.text.SimpleDateFormat
-import java.util.Locale
 
 @Source
-abstract class RocksManga : Madara() {
-    override val dateFormat = SimpleDateFormat("MMMM d, yyyy", Locale("ar"))
+abstract class RocksManga : KeiSource() {
+    private val apiUrl get() = baseUrl.replace("://", "://api.")
 
-    override fun popularMangaSelector() = ".unit .inner"
-    override val popularMangaUrlSelector = ".info a"
-    override fun popularMangaNextPageSelector() = "li.page-item:not(.disabled) > a.page-link[rel=next]"
+    override val supportsFilterFetching = true
 
-    override fun searchMangaSelector() = popularMangaSelector()
-    override fun searchMangaFromElement(element: Element): SManga = popularMangaFromElement(element)
+    override fun getMangaUrl(manga: SManga) = baseUrl + manga.url
 
-    override val mangaDetailsSelectorTitle = ".info h1"
-    override val mangaDetailsSelectorAuthor = "div.meta span:contains(المؤلف:) + a"
-    override val mangaDetailsSelectorArtist = "div.meta span:contains(الرسام:) + a"
-    override val mangaDetailsSelectorStatus = ".info p"
-    override val mangaDetailsSelectorDescription = "div.description"
-    override val mangaDetailsSelectorThumbnail = ".manga-poster img"
-    override val mangaDetailsSelectorGenre = "div.meta span:contains(التصنيفات:) ~ a"
-    override val altNameSelector = ".info h6"
-    override fun chapterListSelector() = "div.list-body-hh ul li"
-    override fun chapterDateSelector() = "span.time"
-    override val pageListParseSelector = "#ch-images .img"
-    override val chapterUrlSuffix = ""
+    override fun getChapterUrl(chapter: SChapter) = baseUrl + chapter.url
 
-    override val useLoadMoreRequest = LoadMoreStrategy.Never
-    override val useNewChapterEndpoint = false
-    override val filterNonMangaItems = false
+    // ============================== Listings ==============================
 
-    override fun searchRequest(page: Int, query: String, filters: FilterList): Request {
-        val urlBuilder = "$baseUrl/".toHttpUrl().newBuilder()
-        return if (query.isNotBlank()) {
-            urlBuilder.addPathSegment(searchPage(page))
-            urlBuilder.addQueryParameter("s", query)
-            GET(urlBuilder.build(), headers)
-        } else {
-            var pathSegments: String? = null
+    override suspend fun getPopularManga(page: Int): MangasPage = browse(page, sort = "most_viewed")
 
-            filters.forEach { filter ->
-                val segment = when (filter) {
-                    is TypeFilter -> filter.toUriPart()
-                    is GenreFilter -> filter.toUriPart()
-                    else -> ""
-                }
+    override suspend fun getLatestUpdates(page: Int): MangasPage = browse(page)
 
-                if (segment.isNotBlank()) {
-                    pathSegments = when (filter) {
-                        is TypeFilter -> "manga-type/$segment/${searchPage(page)}"
-                        is GenreFilter -> "manga-genre/$segment/${searchPage(page)}"
-                        else -> pathSegments
-                    }
-                }
-            }
-
-            pathSegments?.let { urlBuilder.addPathSegments(it) }
-            GET(urlBuilder.build(), headers)
-        }
-    }
-    private val typeFilters: Array<Pair<String, String>> = arrayOf(
-        "ALL" to "",
-        "كوميك" to "comic",
-        "مانجا" to "manga",
-        "مانها" to "manhua",
-        "مانهوا" to "manhwa",
-        "ون شوت" to "one-shot",
-    )
-
-    private class GenreFilter(vals: Array<Pair<String, String>>) : UriPartFilter("Category", vals)
-    private class TypeFilter(vals: Array<Pair<String, String>>) : UriPartFilter("Type", vals)
-
-    override fun parseGenres(document: Document): List<Genre> = document
-        .selectFirst("#nav-menu li:contains(التصنيفات) ul")
-        ?.select("li a")
-        .orEmpty()
-        .map { a ->
-            Genre(
-                a!!.text(),
-                a.attr("href")
-                    .substringAfter("/manga-genre/")
-                    .substringBefore("/"),
-            )
-        }
-
-    override fun getFilterList(): FilterList {
-        launchIO { fetchGenres() }
-
-        return FilterList(
-            if (genresList.isNotEmpty()) {
-                listOf(
-                    Filter.Header("NOTE: Filters are ignored when using text search."),
-                    Filter.Header("NOTE: Type and Genre cannot be used together. Genre will take priority."),
-                    Filter.Separator(),
-                    TypeFilter(typeFilters),
-                    GenreFilter(arrayOf(Pair("ALL", "")) + genresList.map { Pair(it.name, it.id) }.toTypedArray()),
-                )
-            } else {
-                listOf(
-                    TypeFilter(typeFilters),
-                    Filter.Header(intl["genre_missing_warning"]),
-                )
-            },
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
+        val genres = filters.firstInstanceOrNull<GenreFilter>()?.state.orEmpty()
+        return browse(
+            page,
+            sort = filters.firstInstanceOrNull<SortFilter>()?.selected,
+            query = query,
+            type = filters.firstInstanceOrNull<TypeFilter>()?.selected,
+            status = filters.firstInstanceOrNull<StatusFilter>()?.selected,
+            include = genres.filter { it.state == Filter.TriState.STATE_INCLUDE }.map { it.value },
+            exclude = genres.filter { it.state == Filter.TriState.STATE_EXCLUDE }.map { it.value },
         )
     }
 
-    override fun chapterFromElement(element: Element): SChapter {
-        val chapter = super.chapterFromElement(element)
-        chapter.name = element.selectFirst("zebi")!!.text()
-        chapter.scanlator = element.selectFirst(".username span")?.text()
-        return chapter
+    private suspend fun browse(
+        page: Int,
+        sort: String? = null,
+        query: String = "",
+        type: String? = null,
+        status: String? = null,
+        include: List<String> = emptyList(),
+        exclude: List<String> = emptyList(),
+    ): MangasPage {
+        val url = "$baseUrl/browse".toHttpUrl().newBuilder().apply {
+            if (page > 1) addQueryParameter("page", page.toString())
+            if (!sort.isNullOrEmpty()) {
+                addQueryParameter("sort", sort)
+                if (sort == "alphabetical") addQueryParameter("direction", "asc")
+            }
+            if (query.isNotBlank()) addQueryParameter("search", query.trim())
+            if (!type.isNullOrEmpty()) addQueryParameter("type", type)
+            if (!status.isNullOrEmpty()) addQueryParameter("status", status)
+            if (include.isNotEmpty()) addQueryParameter("genre", include.joinToString(","))
+            if (exclude.isNotEmpty()) addQueryParameter("genre_exclude", exclude.joinToString(","))
+        }.build()
+
+        val document = client.get(url, Fetch.DOCUMENT).asJsoup()
+        val mangas = document.select(".catalog-grid-compact .unit, main .unit").distinct().map { it.toSManga() }
+        return MangasPage(mangas, document.selectFirst("li.page-item > a.page-link[rel=next]") != null)
+    }
+
+    private fun Element.toSManga() = SManga.create().apply {
+        val link = selectFirst(".info > a[href]")!!
+        setUrlWithoutDomain(link.absUrl("href"))
+        title = link.text()
+        thumbnail_url = selectFirst("img")?.absUrl("src")
+    }
+
+    // ============================ Details & chapters ============================
+
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
+        val document = client.get(getMangaUrl(manga), Fetch.DOCUMENT).asJsoup()
+
+        val details = document.extractNextJs<DetailsDto> { it is JsonObject && "readHref" in it }!!.manga
+        val chapterList = document.extractNextJs<ChapterListDto> { it is JsonObject && "mangaSlug" in it && "chapters" in it }!!
+
+        return SMangaUpdate(
+            details.toSManga(apiUrl),
+            chapterList.chapters.sortedByDescending { it.id }.map { it.toSChapter(chapterList.mangaSlug) },
+        )
+    }
+
+    // ================================= Pages =================================
+
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val document = client.get(getChapterUrl(chapter), Fetch.DOCUMENT).asJsoup()
+        return document.extractNextJs<ReaderDto> { it is JsonObject && "chapter" in it && "manga" in it }!!
+            .chapter.pages.mapIndexed { i, path -> Page(i, imageUrl = "$apiUrl$path") }
+    }
+
+    // ================================= Filters =================================
+
+    override suspend fun fetchFilterData(): JsonElement = client.get("$baseUrl/browse", Fetch.DOCUMENT).asJsoup()
+        .extractNextJs<GenresDto> { it is JsonObject && "genres" in it && "filters" in it }!!
+        .toJsonElement()
+
+    override fun getFilterList(data: JsonElement?): FilterList {
+        val filters = mutableListOf<Filter<*>>(
+            SortFilter(),
+            TypeFilter(),
+            StatusFilter(),
+        )
+        data?.parseAs<GenresDto>()?.genres?.takeIf { it.isNotEmpty() }?.let { genres ->
+            filters += Filter.Separator()
+            filters += GenreFilter(genres.map { Genre(it.name, it.slug) })
+        }
+        return FilterList(filters)
     }
 }

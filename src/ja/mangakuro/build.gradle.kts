@@ -6,12 +6,16 @@ plugins {
 
 keiyoushi {
     name = "MangaKuro"
-    versionCode = 2
-    contentWarning = ContentWarning.SAFE
-    libVersion = "1.4"
+    versionCode = 4
+    contentWarning = ContentWarning.MIXED
+    libVersion = "1.6"
 
     source {
         lang = "ja"
         baseUrl = "https://mangakuro.net"
+    }
+
+    deeplink {
+        path("/manga/..*")
     }
 }

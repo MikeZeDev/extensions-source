@@ -7,16 +7,17 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
-import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
 import keiyoushi.network.get
 import keiyoushi.network.post
 import keiyoushi.source.KeiSource
+import keiyoushi.utils.asJsoup
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonElement
 import keiyoushi.utils.toJsonRequestBody
-import keiyoushi.utils.tryParse
+import keiyoushi.utils.tryParseDate
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.buildJsonObject
 import okhttp3.FormBody
@@ -25,9 +26,8 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Response
 import org.jsoup.nodes.Document
-import java.net.URLEncoder
-import java.text.SimpleDateFormat
-import java.util.Locale
+import java.time.format.DateTimeFormatter
+import java.util.Calendar
 
 @Source
 abstract class BatCave : KeiSource() {
@@ -38,67 +38,100 @@ abstract class BatCave : KeiSource() {
     }
 
     // ============================== Popular ==============================
-    override suspend fun getPopularManga(page: Int): MangasPage = getSearchMangaList(page, "", SortFilter.POPULAR)
+    override suspend fun getPopularManga(page: Int): MangasPage {
+        val url = baseUrl.toHttpUrl().newBuilder().apply {
+            addPathSegment("comix")
+            if (page > 1) {
+                addPathSegments("page/$page")
+            }
+            addPathSegment("")
+        }.build()
+
+        val body = FormBody.Builder()
+            .add("dlenewssortby", "rating")
+            .add("dledirection", "desc")
+            .add("set_new_sort", "dle_sort_cat_1")
+            .add("set_direction_sort", "dle_direction_cat_1")
+            .build()
+
+        return parseSearchMangas(client.post(url, Fetch.DOCUMENT, body))
+    }
 
     // ============================== Latest ===============================
-    override suspend fun getLatestUpdates(page: Int): MangasPage = getSearchMangaList(page, "", SortFilter.LATEST)
+    override suspend fun getLatestUpdates(page: Int): MangasPage {
+        val url = baseUrl.toHttpUrl().newBuilder().apply {
+            if (page > 1) {
+                addPathSegments("page/$page")
+                addPathSegment("")
+            }
+        }.build()
+
+        val document = client.get(url, Fetch.DOCUMENT).asJsoup()
+
+        val entries = document.select("#content-load > .latest.grid-item").mapNotNull { element ->
+            SManga.create().apply {
+                with(element.selectFirst(".latest__title > a")!!) {
+                    if (ownText().isEmpty()) return@mapNotNull null
+                    setUrlWithoutDomain(absUrl("href"))
+                    title = ownText()
+                }
+                thumbnail_url = posterUrl(this.url)
+            }
+        }
+
+        val hasNextPage = document.selectFirst("li.pagination a[href]") != null
+
+        return MangasPage(entries, hasNextPage)
+    }
 
     // ============================== Search ===============================
     override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
         if (query.isNotBlank()) {
-            val url = buildString {
-                append(baseUrl)
-                append("/search/")
-                append(URLEncoder.encode(query.trim(), "UTF-8"))
+            val url = baseUrl.toHttpUrl().newBuilder().apply {
+                addPathSegment("search")
+                addPathSegment(query)
                 if (page > 1) {
-                    append("/page/")
-                    append(page)
-                    append("/")
+                    addPathSegment("page")
+                    addPathSegment(page.toString())
                 }
-            }
-            return parseSearchMangas(client.get(url))
+                addPathSegment("")
+            }.build()
+            return parseSearchMangas(client.get(url, Fetch.DOCUMENT))
         }
 
         var filtersApplied = false
         val filterPath = buildString {
-            filters.firstInstanceOrNull<YearFilter>()?.addFilterToUrl(this)?.also { filtersApplied = true }
-            filters.firstInstanceOrNull<PublisherFilter>()?.addFilterToUrl(this)?.also { filtersApplied = true }
-            filters.firstInstanceOrNull<GenreFilter>()?.addFilterToUrl(this)?.also { filtersApplied = true }
+            filters.firstInstanceOrNull<YearFilter>()?.takeIf { it.addFilterToUrl(this) }?.let { filtersApplied = true }
+            filters.firstInstanceOrNull<PublisherFilter>()?.takeIf { it.addFilterToUrl(this) }?.let { filtersApplied = true }
+            filters.firstInstanceOrNull<GenreFilter>()?.takeIf { it.addFilterToUrl(this) }?.let { filtersApplied = true }
         }
 
-        val url = buildString {
-            append(baseUrl)
+        val url = baseUrl.toHttpUrl().newBuilder().apply {
+            addPathSegment("ComicList")
+
             if (filtersApplied) {
-                append("/ComicList/")
-                append(filterPath)
+                addPathSegments(filterPath)
             } else {
-                append("/comix/")
+                // Send something to force ComicList
+                addPathSegment("y[from]=1926")
+                addPathSegment("y[to]=${Calendar.getInstance().get(Calendar.YEAR)}")
             }
             if (page > 1) {
-                append("page/")
-                append(page)
-                append("/")
+                addPathSegments("page/$page")
             }
-        }
+            addPathSegment("")
+        }.build()
 
         val sort = filters.firstInstanceOrNull<SortFilter>() ?: SortFilter()
 
-        return if (sort.getSort().isEmpty()) {
-            parseSearchMangas(client.get(url))
-        } else {
-            val form = FormBody.Builder().apply {
-                add("dlenewssortby", sort.getSort())
-                add("dledirection", sort.getDirection())
-                if (filtersApplied) {
-                    add("set_new_sort", "dle_sort_xfilter")
-                    add("set_direction_sort", "dle_direction_xfilter")
-                } else {
-                    add("set_new_sort", "dle_sort_cat_1")
-                    add("set_direction_sort", "dle_direction_cat_1")
-                }
-            }.build()
-            parseSearchMangas(client.post(url, form))
-        }
+        val body = FormBody.Builder()
+            .add("dlenewssortby", sort.getSort())
+            .add("dledirection", sort.getDirection())
+            .add("set_new_sort", "dle_sort_xfilter")
+            .add("set_direction_sort", "dle_direction_xfilter")
+            .build()
+
+        return parseSearchMangas(client.post(url, Fetch.DOCUMENT, body))
     }
 
     private fun parseSearchMangas(response: Response): MangasPage {
@@ -110,7 +143,7 @@ abstract class BatCave : KeiSource() {
                     setUrlWithoutDomain(absUrl("href"))
                     title = ownText()
                 }
-                thumbnail_url = element.selectFirst("img")?.absUrl("data-src")
+                thumbnail_url = posterUrl(url)
             }
         }
         val hasNextPage = document.selectFirst("div.pagination__pages")
@@ -124,7 +157,7 @@ abstract class BatCave : KeiSource() {
     override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
         if (url.host != baseUrl.toHttpUrl().host) return null
         url.pathSegments.firstOrNull() ?: return null
-        return parseMangaDetails(client.get(url).asJsoup())
+        return parseMangaDetails(client.get(url, Fetch.DOCUMENT).asJsoup())
     }
 
     override suspend fun fetchMangaUpdate(
@@ -133,7 +166,7 @@ abstract class BatCave : KeiSource() {
         fetchDetails: Boolean,
         fetchChapters: Boolean,
     ): SMangaUpdate {
-        val doc = client.get(getMangaUrl(manga)).asJsoup()
+        val doc = client.get(getMangaUrl(manga), Fetch.DOCUMENT).asJsoup()
         return SMangaUpdate(parseMangaDetails(doc), parseChapterList(doc))
     }
 
@@ -169,10 +202,9 @@ abstract class BatCave : KeiSource() {
         doc.selectFirst(".page__similar-panel.is-active")?.select(".scroller-2 a.poster")?.let { anchor ->
             memo = buildJsonObject {
                 val similar = anchor.mapNotNull {
-                    val title = it.selectFirst(".poster__title")?.text()?.takeIf { it.isNotBlank() }
-                    val url = it.attr("href").takeIf { it.isNotBlank() }
-                    val thumb = it.selectFirst("img")?.attr("data-src")
-                    if (title != null && url != null) RelatedComic(title, url, thumb) else null
+                    val title = it.selectFirst(".poster__title")?.text()?.takeIf { str -> str.isNotBlank() }
+                    val url = it.attr("href").takeIf { str -> str.isNotBlank() }
+                    if (title != null && url != null) RelatedComic(title, url) else null
                 }
 
                 put("similarComics", similar.toJsonElement())
@@ -195,12 +227,12 @@ abstract class BatCave : KeiSource() {
                 url = "/reader/${data.comicId}/${chap.id}${data.xhash}"
                 name = chap.title
                 chapter_number = chap.number
-                date_upload = dateFormat.tryParse(chap.date)
+                date_upload = dateFormat.tryParseDate(chap.date)
             }
         }
     }
 
-    private val dateFormat = SimpleDateFormat("dd.MM.yyyy", Locale.US)
+    private val dateFormat = DateTimeFormatter.ofPattern("d.M.yyyy")
 
     // ============================== Related ==============================
     override val supportsRelatedMangas get() = true
@@ -211,8 +243,8 @@ abstract class BatCave : KeiSource() {
         return related?.parseAs<List<RelatedComic>>()?.map {
             SManga.create().apply {
                 title = it.name
-                thumbnail_url = "$baseUrl${it.thumbnail}"
                 setUrlWithoutDomain(it.url)
+                thumbnail_url = posterUrl(url)
             }
         } ?: emptyList()
     }
@@ -226,7 +258,7 @@ abstract class BatCave : KeiSource() {
             chapterId = id,
         ).toJsonRequestBody()
 
-        val response = client.post("$baseUrl/engine/ajax/controller.php?mod=api&action=reader/getChapterData", body)
+        val response = client.post("$baseUrl/engine/ajax/controller.php?mod=api&action=reader/getChapterData", Fetch.XHR, body)
         val data = response.parseAs<ChapterApiResponse>().data
         return data.images.mapIndexed { idx, img ->
             val imageUrl = if (img.startsWith("http")) img.trim() else baseUrl + img.trim()
@@ -238,7 +270,7 @@ abstract class BatCave : KeiSource() {
     override val supportsFilterFetching = true
 
     override suspend fun fetchFilterData(): JsonElement {
-        val doc = client.get("$baseUrl/comix").asJsoup()
+        val doc = client.get("$baseUrl/comix/", Fetch.DOCUMENT).asJsoup()
         val script = doc.selectFirst("script:containsData(window.__XFILTER__)")?.data()
             ?: error("Filter data not found")
 
@@ -276,6 +308,9 @@ abstract class BatCave : KeiSource() {
         ?.selectFirst("> a")
         ?.text()
         ?.takeIf { it.isNotBlank() }
+
+    // List pages only have 64x96 to 142x212 previews; the full poster is keyed by the comic id.
+    private fun posterUrl(mangaUrl: String) = "$baseUrl/uploads/posts/hd/${mangaUrl.substringAfterLast('/').substringBefore('-')}.webp"
 
     companion object {
         private val intRegex = Regex("""^\d+""")

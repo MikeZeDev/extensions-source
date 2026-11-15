@@ -8,10 +8,14 @@ keiyoushi {
     name = "MyAdultComics"
     versionCode = 1
     contentWarning = ContentWarning.NSFW
-    libVersion = "1.4"
+    libVersion = "1.6"
 
     source {
         lang = "en"
         baseUrl = "https://myadultcomics.com"
+    }
+
+    deeplink {
+        path("/read.php")
     }
 }

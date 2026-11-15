@@ -1,199 +1,212 @@
 package eu.kanade.tachiyomi.extension.en.templescan
 
 import androidx.preference.PreferenceScreen
-import eu.kanade.tachiyomi.network.GET
+import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.source.ConfigurableSource
-import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
+import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
-import keiyoushi.lib.randomua.addRandomUAPreference
-import keiyoushi.lib.randomua.setRandomUserAgent
+import keiyoushi.lib.cronet.cronet
+import keiyoushi.network.Fetch
+import keiyoushi.network.post
 import keiyoushi.network.rateLimit
-import keiyoushi.utils.extractNextJs
-import okhttp3.Request
-import okhttp3.Response
-import org.jsoup.Jsoup
-import org.jsoup.safety.Safelist
-import rx.Observable
-import kotlin.math.min
+import keiyoushi.source.KeiSource
+import keiyoushi.utils.MarkdownDescription
+import keiyoushi.utils.asJsoup
+import keiyoushi.utils.attrOrNull
+import keiyoushi.utils.firstInstanceOrNull
+import keiyoushi.utils.getPreferencesLazy
+import keiyoushi.utils.getTurnstileToken
+import keiyoushi.utils.parseAs
+import keiyoushi.utils.textOrNull
+import keiyoushi.utils.toJsonRequestBody
+import keiyoushi.utils.toJsonString
+import keiyoushi.utils.tryParse
+import kotlinx.serialization.json.JsonElement
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.OkHttpClient
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
+import java.io.IOException
+import kotlin.time.Instant
 
 @Source
 abstract class TempleScan :
-    HttpSource(),
+    KeiSource(),
     ConfigurableSource {
 
-    override val supportsLatest = true
-
-    override fun headersBuilder() = super.headersBuilder()
-        .set("referer", "$baseUrl/")
-        .set("origin", baseUrl)
-        .setRandomUserAgent()
-
-    private val rscHeaders = headersBuilder()
-        .set("rsc", "1")
-        .build()
-
-    override val client = network.client.newBuilder()
-        .rateLimit(1)
-        .build()
-
-    override fun fetchPopularManga(page: Int): Observable<MangasPage> = fetchSearchManga(page, "", OrderFilter.POPULAR)
-
-    override fun fetchLatestUpdates(page: Int): Observable<MangasPage> = fetchSearchManga(page, "", OrderFilter.LATEST)
-
-    private lateinit var seriesCache: List<BrowseSeries>
-
-    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
-        if (page == 1) {
-            client.newCall(searchMangaRequest(page, query, filters))
-                .execute()
-                .use(::parseSearchResponse)
-        }
-        return Observable.just(parseDirectory(page, query, filters))
+    private val preferences by getPreferencesLazy {
+        edit().remove("pref_rsc_keys").remove("pref_rsc_key_table").apply()
     }
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = GET("$baseUrl/comics", rscHeaders)
+    private val siteHost get() = baseUrl.toHttpUrl().host
 
-    private fun parseSearchResponse(response: Response) {
-        seriesCache = response.extractNextJs<List<BrowseSeries>>()!!
+    override fun OkHttpClient.Builder.configureClient() = apply {
+        // The site's pages and API, apart from the bundles; images on its media host
+        rateLimit(2) { it.host == siteHost && !it.encodedPath.startsWith("/_next/static/") }
+        rateLimit(1) { it.host != siteHost }
+        cronet()
     }
 
-    private fun parseDirectory(page: Int, query: String, filters: FilterList): MangasPage {
-        val status = filters.get<StatusFilter>()?.selected
-        val mangaList = seriesCache.filter { series ->
+    private val sitePages by lazy { SitePages(baseUrl, client, { headers["User-Agent"]!! }, ::passSiteCheck) }
 
-            val queryFilter = query.isBlank() ||
-                series.title.contains(query, ignoreCase = true) ||
-                series.alternativeNames?.contains(query, ignoreCase = true) == true
+    // Outside the site's page: its verify request is refused with any `X-Requested-With`, which WebView always sends
+    private suspend fun passSiteCheck(siteKey: String) {
+        val token = getTurnstileToken("$baseUrl/challenge", siteKey)
+        client.post("$baseUrl/api/turnstile/verify", fetch = Fetch.XHR.from("/challenge"), body = TurnstileToken(token).toJsonRequestBody()).close()
+    }
 
-            val statusFilter = status == null || series.status == status
+    override suspend fun getPopularManga(page: Int) = getSearchMangaList(page, "", OrderFilter.POPULAR)
 
-            queryFilter && statusFilter
-        }.let {
-            val order = filters.get<OrderFilter>()?.selected
+    override suspend fun getLatestUpdates(page: Int) = getSearchMangaList(page, "", OrderFilter.LATEST)
 
-            when (order) {
-                "updated" -> it.sortedByDescending { series -> series.updated }
-                "created" -> it.sortedByDescending { series -> series.created }
-                "views" -> it.sortedByDescending { series -> series.views }
-                else -> it
-            }
-        }
-
-        return MangasPage(
-            mangas = mangaList.subList((page - 1) * 20, min(page * 20, mangaList.size))
-                .map { it.toSManga() },
-            hasNextPage = page * 20 < mangaList.size,
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
+        val order = filters.firstInstanceOrNull<OrderFilter>()
+        // The site search ignores the filters; the cards of every status give its results their covers
+        val args = CatalogArgs(
+            statuses = if (query.isNotBlank()) STATUSES else filters.firstInstanceOrNull<StatusFilter>()?.selected ?: STATUSES.take(1),
+            order = order?.selected,
+            direction = order?.direction,
+            query = query.trim().ifEmpty { null },
         )
+        val catalog = sitePages.read("$baseUrl/comics", "catalog.js", args.toJsonString()).parseAs<CatalogPage>()
+
+        val cards = catalog.cards.flatMap { it.asJsoup(baseUrl).select("a[href^=/comic/]:has(h2)") }
+            .map(::cardToManga)
+            .distinctBy { it.url }
+        val mangas = catalog.results?.let { results ->
+            val covers = cards.associate { it.url to it.thumbnail_url }
+            results.asJsoup(baseUrl).select("[role=option][href^=/comic/]").map { option ->
+                // Title, alternative names, then the status and type tags
+                val info = option.selectFirst("> span:last-child")!!
+                val tags = info.select("> span:last-child > span")
+                SManga.create().apply {
+                    url = "/comic/${option.absUrl("href").toHttpUrl().pathSegments[1]}"
+                    title = info.selectFirst("> span")!!.textOrNull()!!
+                    thumbnail_url = covers[url]
+                    status = parseStatus(tags.getOrNull(0)?.text())
+                    genre = tags.getOrNull(1)?.text()?.withoutRating()
+                }
+            }
+        } ?: cards
+
+        return MangasPage(mangas, hasNextPage = false)
     }
 
-    override fun getFilterList() = getFilters()
+    private fun cardToManga(link: Element) = SManga.create().apply {
+        val card = link.parent()!!
+        url = "/comic/${link.absUrl("href").toHttpUrl().pathSegments[1]}"
+        title = link.textOrNull()!!
+        thumbnail_url = card.selectFirst("img")?.absUrl("src")
+        genre = card.selectFirst("> span")?.text()?.withoutRating()
+    }
 
-    // =========================== Manga Details ============================
-    override fun mangaDetailsParse(response: Response): SManga {
-        val details = response.extractNextJs<SeriesDetails>()!!
+    override fun getFilterList(data: JsonElement?) = getFilters()
+
+    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
+        if (url.host != siteHost || url.pathSegments[0] != "comic") {
+            return null
+        }
+
+        val slug = url.pathSegments.getOrNull(1) ?: return null
+        val manga = SManga.create().apply {
+            this.url = "/comic/$slug"
+        }
+
+        return getMangaUpdate(manga, emptyList(), fetchDetails = true, fetchChapters = false).manga
+    }
+
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
+        val document = sitePages.read(getMangaUrl(manga), "series.js")
+            .parseAs<HtmlPage>().html
+            .asJsoup(baseUrl)
+        val details = if (fetchDetails) parseDetails(document, manga.url) else manga
+        return SMangaUpdate(details, parseChapters(document))
+    }
+
+    private fun parseDetails(document: Document, url: String): SManga {
+        val series = document.jsonLd<ComicSeriesLd> { it.isSeries }
+        val genres = series?.genre.orEmpty()
+        val stats = document.select("ul[aria-label=\"Series stats\"] li")
 
         return SManga.create().apply {
-            url = "/comic/${details.slug}"
-            title = details.title
-            thumbnail_url = details.thumbnail
-            status = when (details.status) {
-                "Ongoing" -> SManga.ONGOING
-                "Hiatus" -> SManga.ON_HIATUS
-                "Completed" -> SManga.COMPLETED
-                "Canceled" -> SManga.CANCELLED
-                "Dropped" -> SManga.CANCELLED
-                else -> SManga.UNKNOWN
-            }
-            author = details.author
-            artist = details.studio
-            // Sometimes site adds #tags at the end of description
-            // Site can use any word to indicate tags, I saw at least: "Tags:", "Keywords:", TAGS
-            val cleanDescription = if (details.description?.contains("#") == true) {
-                details.description.substringBefore("#").replace(LAST_WORD_REGEX, "").trim()
-            } else {
-                details.description.toString()
-            }
-            description = buildString {
-                append(Jsoup.clean(cleanDescription, Safelist.none()))
-                details.alternativeNames?.takeIf { it.isNotBlank() }?.let {
-                    append("\n\n")
-                    append("Alternative Name: $it\n")
-                }
-            }
+            this.url = url
+            title = document.selectFirst("#series-title")!!.text()
+            thumbnail_url = series?.image
+            author = (document.info("Author") ?: series?.author?.name)
+                ?.split('|')?.map(String::trim)?.filter(String::isNotEmpty)?.joinToString()?.ifEmpty { null }
+            status = stats.map { parseStatus(it.text()) }.firstOrNull { it != SManga.UNKNOWN } ?: SManga.UNKNOWN
             genre = buildList {
-                add(details.badge)
-                add(details.year)
-                if (details.adult) {
-                    add("Adult")
-                }
-                details.tags?.map { it.tag.name }?.let { addAll(it) }
-                details.description?.takeIf { it.contains("#") }?.let { desc ->
-                    addAll(TEXT_TAGS_REGEX.findAll(desc).map { it.groupValues[1] })
-                }
-            }.filterNotNull().joinToString()
+                if (genres.any { it.equals("+18", ignoreCase = true) }) add("Adult")
+                addAll(genres.filterNot { it.equals("+18", ignoreCase = true) })
+            }.joinToString().ifEmpty { null }
+            description = MarkdownDescription.Builder().apply {
+                description(document.selectFirst("#series-synopsis-text"))
+                field("Views", stats.selectFirst("span[title$= views]")?.attrOrNull("title")?.removeSuffix(" views"))
+                field("Studio", document.info("Studio"))
+                field("Released", document.info("Released"))
+                // Commas also appear inside names; only `|` always separates them, in author names too
+                altTitles((series?.alternateName ?: document.info("Also known as"))?.split('|').orEmpty())
+            }.build()
         }
     }
 
-    override fun getMangaUrl(manga: SManga) = "$baseUrl${manga.url}"
+    private fun parseChapters(document: Document): List<SChapter> {
+        val hideLocked = preferences.getBoolean(PREF_HIDE_LOCKED_CHAPTERS, true)
+        return document.select("a[id^=chapter-link-]").mapNotNull { row ->
+            val premium = row.selectFirst("span:matchesOwn(^Premium$)") != null
+            if (hideLocked && premium) return@mapNotNull null
 
-    override fun mangaDetailsRequest(manga: SManga): Request = GET("$baseUrl${manga.url}", rscHeaders)
-
-    // ============================== Chapters ==============================
-    override fun chapterListRequest(manga: SManga): Request = GET("$baseUrl${manga.url}", rscHeaders)
-
-    override fun chapterListParse(response: Response): List<SChapter> {
-        val chapters = response.extractNextJs<ChapterList>() ?: return emptyList()
-        val mangaSlug = response.request.url.pathSegments.last()
-
-        return chapters.seasons.flatMap { season ->
-            season.chapters.filter {
-                it.price == 0
-            }.map { chapter ->
-                SChapter.create().apply {
-                    url = "/comic/$mangaSlug/${chapter.slug}"
-                    name = buildString {
-                        append(chapter.name)
-                        if (!chapter.title.isNullOrBlank()) {
-                            append(": ", chapter.title)
-                        }
-                    }
-                    date_upload = chapter.created
+            // The chapter name, then its title if it has one
+            val spans = row.select("div:has(> span > time) > span:not(:has(time))")
+            SChapter.create().apply {
+                url = row.absUrl("href").toHttpUrl().encodedPath
+                name = buildString {
+                    if (premium) append(LOCK)
+                    append(spans.first()!!.textOrNull()!!)
+                    spans.getOrNull(1)?.textOrNull()?.let { append(": ", it) }
                 }
+                date_upload = Instant.tryParse(row.selectFirst("time")?.attr("datetime"))
             }
         }
     }
 
-    // =============================== Pages ================================
-    override fun pageListRequest(chapter: SChapter): Request = GET("$baseUrl${chapter.url}", rscHeaders)
-
-    override fun pageListParse(response: Response): List<Page> {
-        val data = response.extractNextJs<PagesList>() ?: return emptyList()
-        return data.pages.mapIndexed { idx, url ->
-            Page(idx, imageUrl = url)
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val imageHost = ".$siteHost"
+        return sitePages.read(getChapterUrl(chapter), "pages.js").parseAs<ReaderPage>().pages.mapIndexed { index, url ->
+            if (!url.toHttpUrl().host.endsWith(imageHost)) throw IOException("Unexpected page url from the site's reader")
+            Page(index, imageUrl = url)
         }
     }
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        screen.addRandomUAPreference()
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_HIDE_LOCKED_CHAPTERS
+            title = "Hide locked chapters"
+            summary = "Hide early access chapters that require a subscription. If disabled, they are shown with a \uD83D\uDD12 prefix but stay unreadable without a subscription."
+            setDefaultValue(true)
+        }.also(screen::addPreference)
     }
 
-    private inline fun <reified T : Filter<*>> FilterList.get(): T? = filterIsInstance<T>().firstOrNull()
+    private fun Document.info(label: String) = select("dl dt").firstOrNull { it.text() == label }
+        ?.nextElementSibling()?.textOrNull()
 
-    override fun popularMangaRequest(page: Int) = throw UnsupportedOperationException()
-    override fun popularMangaParse(response: Response) = throw UnsupportedOperationException()
-    override fun searchMangaParse(response: Response) = throw UnsupportedOperationException()
-    override fun latestUpdatesRequest(page: Int) = throw UnsupportedOperationException()
-    override fun latestUpdatesParse(response: Response) = throw UnsupportedOperationException()
-    override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
+    private inline fun <reified T> Document.jsonLd(predicate: (T) -> Boolean): T? = select("script[type=application/ld+json]")
+        .mapNotNull { runCatching { it.data().parseAs<T>() }.getOrNull() }
+        .firstOrNull(predicate)
 
     companion object {
-        private val TEXT_TAGS_REGEX = """(?i)#(\w+)""".toRegex()
-        private val LAST_WORD_REGEX = """[\w\s]+:?\s*$""".toRegex()
+        private const val PREF_HIDE_LOCKED_CHAPTERS = "pref_hide_locked_chapters"
+        private const val LOCK = "\uD83D\uDD12 "
     }
 }

@@ -6,9 +6,9 @@ plugins {
 
 keiyoushi {
     name = "Pixiv"
-    versionCode = 12
+    versionCode = 1
     contentWarning = ContentWarning.MIXED
-    libVersion = "1.4"
+    libVersion = "1.6"
 
     listOf("en", "ja", "zh", "zh-tw", "ko").forEach {
         source {

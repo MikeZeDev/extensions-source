@@ -10,24 +10,17 @@ import kotlinx.serialization.Serializable
 import okhttp3.MultipartBody
 import okhttp3.Request
 import org.jsoup.nodes.Document
-import java.text.SimpleDateFormat
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 
 @Source
 abstract class BarManga : Madara() {
-    override val dateFormat = SimpleDateFormat("dd/MM/yyyy", Locale.ROOT)
-
-    override val useLoadMoreRequest = LoadMoreStrategy.Never
-
-    override fun popularMangaSelector() = "#loop-content .mp-card"
-
-    override val popularMangaUrlSelector = ".mp-card-title > a"
+    override val chapterDateFormat = DateTimeFormatter.ofPattern("dd/MM/yyyy", Locale.ROOT)
 
     override val mangaDetailsSelectorTitle = ".breadcrumb > li:last-child > a"
 
-    override fun pageListParse(document: Document): List<Page> {
-        launchIO { countViews(document) }
-        val script = document.selectFirst(".manga-reader-container + script")!!.data()
+    override fun parsePages(document: Document): List<Page> {
+        val script = document.selectFirst(".manga-reader-container + script")?.data() ?: return super.parsePages(document)
         val tokens = PAGE_TOKENS_REGEX.find(script)?.groupValues?.last()?.parseAs<Map<String, String>>() ?: return emptyList()
         val nonce = NONCE_REGEX.find(script)?.groupValues?.last() ?: return emptyList()
         val action = ACTION_REGEX.find(script)?.groupValues?.last() ?: return emptyList()
@@ -39,8 +32,10 @@ abstract class BarManga : Madara() {
             }
     }
 
-    override fun imageRequest(page: Page): Request {
-        val dto = page.imageUrl!!.parseAs<PageDto>()
+    override fun getImageRequest(page: Page): Request {
+        val dto = runCatching {
+            page.imageUrl!!.parseAs<PageDto>()
+        }.getOrElse { return super.getImageRequest(page) }
         val body = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
             .addFormDataPart("action", dto.action)
@@ -51,11 +46,7 @@ abstract class BarManga : Madara() {
             .build()
 
         val imageHeaders = headers.newBuilder()
-            .set("Accept", "*/*")
             .set("Origin", baseUrl)
-            .set("Sec-Fetch-Dest", "empty")
-            .set("Sec-Fetch-Mode", "cors")
-            .set("Sec-Fetch-Site", "same-origin")
             .set("X-Requested-With", "XMLHttpRequest")
             .set("Referer", page.url)
             .build()

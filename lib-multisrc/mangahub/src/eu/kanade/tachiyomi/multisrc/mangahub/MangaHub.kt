@@ -1,41 +1,50 @@
 package eu.kanade.tachiyomi.multisrc.mangahub
 
-import eu.kanade.tachiyomi.network.GET
+import android.util.Base64
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
-import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.network.Fetch
+import keiyoushi.network.addCookie
 import keiyoushi.network.get
 import keiyoushi.network.post
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.GraphQLException
-import keiyoushi.utils.firstInstance
 import keiyoushi.utils.firstInstanceOrNull
+import keiyoushi.utils.get
+import keiyoushi.utils.getArray
+import keiyoushi.utils.getString
 import keiyoushi.utils.graphQLBody
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.parseGraphQLAs
+import keiyoushi.utils.string
 import keiyoushi.utils.toJsonElement
+import keiyoushi.utils.tryParse
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
-import okhttp3.Call
-import okhttp3.Callback
 import okhttp3.Cookie
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Request
+import okhttp3.OkHttpClient
 import okhttp3.RequestBody
 import okhttp3.Response
-import java.io.IOException
 import java.net.URLEncoder
+import java.security.GeneralSecurityException
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 import kotlin.random.Random
+import kotlin.time.Clock
 import kotlin.time.Duration.Companion.days
 import kotlin.time.Instant
 
@@ -43,97 +52,91 @@ abstract class MangaHub : KeiSource() {
 
     abstract val mangaSource: String
 
-    private val baseApiUrl get() = "https://api.mghcdn.com"
     private val baseCdnUrl get() = "https://imgx.mghcdn.com"
     private val baseThumbCdnUrl get() = "https://thumb.mghcdn.com"
+
+    override fun OkHttpClient.Builder.configureClient() = addCookie { listOf("mhub_access" to apiKey) }
+
+    private var apiKey: String = client.cookieJar
+        .loadForRequest(baseUrl.toHttpUrl())
+        .firstOrNull { it.name == "mhub_access" && it.value.isNotEmpty() }?.value
+        ?: generateRandomKey()
+
     private val apiRegex = Regex("mhub_access=([^;]+)")
     private val spaceRegex = Regex("\\s+")
-    private val apiErrorRegex = Regex("""rate\s*limit|api\s*key""")
+    private val apiErrorRegex = Regex("""rate\s*limit|api\s*key\s*(?:invalid)?|encryption(?:\s*error)?""", RegexOption.IGNORE_CASE)
 
     override fun Headers.Builder.configureHeaders() = this
-        .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9")
         .set("Accept-Language", "en-US,en;q=0.5")
         .set("DNT", "1")
-        .set("Sec-Fetch-Dest", "document")
-        .set("Sec-Fetch-Mode", "navigate")
-        .set("Sec-Fetch-Site", "same-origin")
-        .set("Upgrade-Insecure-Requests", "1")
 
     private val apiHeaders get() = headersBuilder()
         .set("Accept", "application/json")
-        .set("Sec-Fetch-Dest", "empty")
-        .set("Sec-Fetch-Mode", "cors")
-        .set("Sec-Fetch-Site", "cross-site")
-        .removeAll("Upgrade-Insecure-Requests")
 
-    private fun accessCookie(): Cookie? = client.cookieJar
-        .loadForRequest(baseUrl.toHttpUrl())
-        .firstOrNull { it.name == "mhub_access" && it.value.isNotEmpty() }
-
-    private suspend fun <T> fetchGraphQL(
+    private suspend inline fun <reified T> fetchGraphQL(
         query: String,
         refreshUrl: String? = null,
-        parse: (Response) -> T,
     ): T {
-        val body = graphQLBody(query = query)
-
         return try {
-            parse(apiRequest(body))
-        } catch (e: Throwable) {
-            val shouldRefresh = e is MangaHubCookieNotFound ||
-                (e is GraphQLException && apiErrorRegex.containsMatchIn(e.message ?: ""))
+            apiRequest(graphQLBody(query = query)).parseGraphQLAs<T>()
+        } catch (e: GraphQLException) {
+            if (!isApiError(e)) throw e
 
-            if (!shouldRefresh) throw e
+            val oldKey = apiKey
+            refreshApiKey(refreshUrl, oldKey)
 
-            refreshApiKey(refreshUrl)
-            parse(apiRequest(body))
+            if (apiKey != oldKey) {
+                try {
+                    return apiRequest(graphQLBody(query = query)).parseGraphQLAs<T>()
+                } catch (e2: GraphQLException) {
+                    if (!isApiError(e2)) throw e2
+                }
+            }
+
+            apiKey = generateRandomKey()
+            apiRequest(graphQLBody(query = query)).parseGraphQLAs<T>()
         }
     }
 
-    private suspend fun apiRequest(body: RequestBody): Response {
-        val cookie = accessCookie() ?: throw MangaHubCookieNotFound()
+    private fun isApiError(e: GraphQLException): Boolean = apiErrorRegex.containsMatchIn(e.message.orEmpty())
 
+    private fun generateRandomKey(): String = Random.nextBytes(16).toHexString()
+
+    private suspend fun apiRequest(body: RequestBody): Response {
         val requestHeaders = apiHeaders
-            .set("x-mhub-access", cookie.value)
+            .set("x-mhub-access", apiKey)
             .build()
 
-        return client.post("$baseApiUrl/graphql", requestHeaders, body)
+        return client.post("$baseUrl/graphql", requestHeaders, Fetch.XHR, body)
     }
 
-    private class MangaHubCookieNotFound : IOException("mhub_access cookie not found")
-
     private val refreshMutex = Mutex()
-    private var lastRefresh = 0L
 
-    private suspend fun refreshApiKey(refreshUrl: String? = null) = refreshMutex.withLock {
-        if (System.currentTimeMillis() - lastRefresh < 10_000) return@withLock
+    private suspend fun refreshApiKey(refreshUrl: String?, oldKey: String) = refreshMutex.withLock {
+        if (apiKey != oldKey) return@withLock
 
         val url = refreshUrl?.toHttpUrl()
             ?: "$baseUrl/chapter/martial-peak/chapter-${Random.nextInt(1000, 3000)}".toHttpUrl()
-        val oldKey = accessCookie()?.value
 
         val refreshHeaders = headersBuilder()
             .set("Referer", "$baseUrl/manga/${url.pathSegments[1]}")
             .build()
 
-        for (i in 1..2) {
-            val cookie = Cookie.parse(url, "mhub_access=; Max-Age=0; Path=/")!!
-            client.cookieJar.saveFromResponse(url, listOf(cookie))
+        // Key from the chapter page itself, which redirects for licensed titles a mirror sends to another domain
+        val noRedirectClient = client.newBuilder().followRedirects(false).build()
 
-            val query = if (i == 2) "?reloadKey=1" else ""
-            val response = try {
-                client.get("$url$query", refreshHeaders, ensureSuccess = false)
-            } catch (_: Throwable) {
-                throw Exception("An error occurred while obtaining a new API key")
-            }
-            val returnedKey = response.headers["set-cookie"]
-                ?.let { apiRegex.find(it)?.groupValues?.get(1) }
+        for (i in 1..2) {
+            val query = if (i == 1) "?reloadKey=1" else ""
+            val response = noRedirectClient.get("$url$query", refreshHeaders, Fetch.DOCUMENT, ensureSuccess = false)
+            val returnedKey = response.headers("Set-Cookie")
+                .firstNotNullOfOrNull { apiRegex.find(it)?.groupValues?.get(1) }
             response.close()
 
-            if (returnedKey != oldKey) break // Got an allegedly valid API key
+            if (!returnedKey.isNullOrEmpty() && returnedKey != oldKey) {
+                apiKey = returnedKey
+                return@withLock
+            }
         }
-
-        lastRefresh = System.currentTimeMillis()
     }
 
     override suspend fun getPopularManga(page: Int): MangasPage = getMangaList(page, order = "POPULAR")
@@ -141,24 +144,24 @@ abstract class MangaHub : KeiSource() {
     override suspend fun getLatestUpdates(page: Int): MangasPage = getMangaList(page, order = "LATEST")
 
     override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
-        var order = "POPULAR"
-        var genres = "all"
+        val order = filters.firstInstanceOrNull<OrderFilter>()?.selected ?: "POPULAR"
+        val genre = filters.firstInstanceOrNull<GenreFilter>()?.selected ?: "all"
+        val hideNsfw = filters.firstInstanceOrNull<HideNsfwFilter>()?.state ?: false
+        val hideYaoi = filters.firstInstanceOrNull<HideYaoiFilter>()?.state ?: false
 
-        filters.forEach { filter ->
-            when (filter) {
-                is OrderBy -> order = filter.values[filter.state].key
-                is GenreList -> genres = filter.included.joinToString(",").takeIf { it.isNotBlank() } ?: "all"
-                else -> {}
-            }
-        }
-
-        return getMangaList(page, order, query, genres)
+        return getMangaList(page, order, query, genre, hideNsfw, hideYaoi)
     }
 
-    private suspend fun getMangaList(page: Int, order: String, query: String = "", genres: String = "all"): MangasPage {
-        val rows = fetchGraphQL(searchQuery(mangaSource, query, genres, order, page)) {
-            it.parseGraphQLAs<ApiSearchObject>()
-        }.search!!.rows
+    private suspend fun getMangaList(
+        page: Int,
+        order: String,
+        query: String = "",
+        genre: String = "all",
+        hideNsfw: Boolean = false,
+        hideYaoi: Boolean = false,
+    ): MangasPage {
+        val rows = fetchGraphQL<ApiSearchObject>(searchQuery(mangaSource, query, genre, order, hideNsfw, hideYaoi, page))
+            .search!!.rows
 
         val mangas = rows.map {
             SManga.create().apply {
@@ -181,33 +184,34 @@ abstract class MangaHub : KeiSource() {
             else -> null
         }?.takeIf { it.isNotEmpty() } ?: return null
 
-        return fetchGraphQL(
+        return fetchGraphQL<ApiMangaObject>(
             mangaQuery(mangaSource, slug),
             refreshUrl = "$baseUrl/manga/$slug",
-        ) { it.parseGraphQLAs<ApiMangaObject>() }.manga!!
+        ).manga!!
             .toSManga()
             .apply { this.url = "/manga/$slug" }
     }
 
     override val supportsRelatedMangas get() = true
 
+    // Story genres, not the API's tag groups
+    private val relatedGenreGroups = setOf("Genre", "Theme", null)
+
     override suspend fun fetchRelatedMangaList(manga: SManga): List<SManga> {
         val mangaGenres = manga.genre
             ?.split(",")
             ?.map { it.trim().lowercase() }
             ?.toSet()
-            ?.takeIf { it.isNotEmpty() }
             ?: return emptyList()
 
-        val filters = getFilterList()
-        filters.firstInstanceOrNull<GenreList>()?.apply {
-            state
-                .filter { it.name.lowercase() in mangaGenres }
-                .forEach { it.state = true }
-        } ?: return emptyList()
-        filters.firstInstance<OrderBy>().apply { state = Random.nextInt(orderBy.size) }
+        val genre = getFilterList().firstInstanceOrNull<GenreFilter>()
+            ?.genres
+            ?.filter { it.group in relatedGenreGroups && it.title.lowercase() in mangaGenres }
+            ?.randomOrNull()
+            ?: return emptyList()
 
-        return getSearchMangaList(page = 1, query = "", filters = filters).mangas
+        return getMangaList(page = 1, order = "POPULAR", genre = genre.slug).mangas
+            .filterNot { it.url == manga.url }
     }
 
     override suspend fun fetchMangaUpdate(
@@ -217,10 +221,10 @@ abstract class MangaHub : KeiSource() {
         fetchChapters: Boolean,
     ): SMangaUpdate {
         val slug = manga.url.removePrefix("/manga/")
-        val data = fetchGraphQL(
+        val data = fetchGraphQL<ApiMangaObject>(
             mangaQuery(mangaSource, slug),
             refreshUrl = "$baseUrl${manga.url}",
-        ) { it.parseGraphQLAs<ApiMangaObject>() }.manga!!
+        ).manga!!
 
         return SMangaUpdate(
             manga = data.toSManga(),
@@ -263,7 +267,7 @@ abstract class MangaHub : KeiSource() {
             name = generateChapterName(it.title.trim().replace(spaceRegex, " "), numberString)
             url = "/$slug/chapter-${it.number}"
             chapter_number = it.number
-            date_upload = Instant.parseOrNull(it.date)?.toEpochMilliseconds() ?: 0L
+            date_upload = Instant.tryParse(it.date)
         }
     }.asReversed()
 
@@ -281,18 +285,23 @@ abstract class MangaHub : KeiSource() {
             it[1] to it[2].substringAfter("-").toFloat()
         }
 
-        val chapterObject = fetchGraphQL(
+        val chapterObject = fetchGraphQL<ApiChapterData>(
             pagesQuery(mangaSource, slug, number),
             refreshUrl = "$baseUrl/chapter${chapter.url}",
-        ) { it.parseGraphQLAs<ApiChapterData>() }.chapter!!
-        val pages = chapterObject.pages.parseAs<ApiChapterPages>()
+        ).chapter!!
+
+        val pagesString = if (chapterObject.pages.startsWith("enc:v1")) {
+            decryptPages(chapterObject.pages)
+        } else {
+            chapterObject.pages
+        }
 
         // We'll update the cookie here to match the browser's "recently" opened chapter.
         // This mimics how the browser works and gives us more chance to receive a valid API key upon refresh
-        val now = System.currentTimeMillis()
+        val now = Clock.System.now()
         val baseHttpUrl = baseUrl.toHttpUrl()
         val recently = buildJsonObject {
-            putJsonObject(now.toString()) {
+            putJsonObject(now.toEpochMilliseconds().toString()) {
                 put("mangaID", chapterObject.mangaID)
                 put("number", chapterObject.chapterNumber)
             }
@@ -302,72 +311,80 @@ abstract class MangaHub : KeiSource() {
             .domain(baseHttpUrl.host)
             .name("recently")
             .value(URLEncoder.encode(recently, "utf-8"))
-            .expiresAt(now.plus(60.days.inWholeMilliseconds))
+            .expiresAt((now + 60.days).toEpochMilliseconds())
             .build()
 
         client.cookieJar.saveFromResponse(baseHttpUrl, listOf(recentlyCookie))
 
-        // Best-effort logging to further increase the chance of a valid API key
-        logChapterView(slug, chapterObject.chapterNumber)
-
-        return pages.images.mapIndexed { i, page ->
-            Page(i, imageUrl = "$baseCdnUrl/${pages.page}$page")
-        }
-    }
-
-    // Mimics the browser logging a chapter view
-    private fun logChapterView(slug: String, chapterNumber: Float) {
-        GET("https://api.ipify.org?format=json").enqueue { ipResponse ->
-            val ip = ipResponse.parseAs<PublicIPResponse>().ip
-            GET("$baseUrl/action/logHistory2/$slug/$chapterNumber?browserID=$ip", headers).enqueue()
-        }
-    }
-
-    private fun Request.enqueue(onResponse: (Response) -> Unit = Response::close) {
-        client.newCall(this).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {}
-            override fun onResponse(call: Call, response: Response) {
-                try {
-                    onResponse(response)
-                } catch (_: Throwable) {
-                    response.close()
-                }
+        val pageUrls: List<String> = when (val jsonPages = pagesString.parseAs<JsonElement>()) {
+            is JsonObject if "i" in jsonPages -> {
+                val prefix = jsonPages.getString("p")
+                jsonPages.getArray("i").map { "$prefix${it.string}" }
             }
-        })
+            is JsonArray -> {
+                jsonPages.map { it.string }
+            }
+            is JsonObject -> {
+                jsonPages.values.map { it.string }
+            }
+            else -> {
+                emptyList()
+            }
+        }
+
+        return pageUrls.mapIndexed { i, path ->
+            val url = if (path.startsWith("http://") || path.startsWith("https://")) {
+                path
+            } else {
+                "$baseCdnUrl/${path.removePrefix("/")}"
+            }
+            Page(i, imageUrl = url)
+        }
+    }
+
+    private suspend fun decryptPages(pages: String): String {
+        val cryptoParams = client.get("$baseUrl/api/chapter-crypto", apiHeaders.build(), Fetch.XHR)
+            .parseAs<ChapterCryptoDto>()
+
+        val parts = pages.split(":")
+        val keyId = parts[2]
+        val iv = parts[3]
+        val authTag = parts[4]
+        val ciphertext = parts[5]
+
+        val keyData = cryptoParams.keys?.get(keyId)
+            ?: cryptoParams.key?.takeIf { cryptoParams.keyId == null || cryptoParams.keyId == keyId }
+            ?: throw GeneralSecurityException("Key not found for keyId: $keyId")
+        val keyBytes = Base64.decode(keyData, Base64.URL_SAFE)
+        val ivBytes = Base64.decode(iv, Base64.URL_SAFE)
+        val authTagBytes = Base64.decode(authTag, Base64.URL_SAFE)
+        val cipherBytes = Base64.decode(ciphertext, Base64.URL_SAFE)
+
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply {
+            init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), GCMParameterSpec(128, ivBytes))
+        }
+
+        return cipher.doFinal(cipherBytes + authTagBytes).decodeToString()
     }
 
     // Filters
-    private val orderBy = arrayOf(
-        Order("Popular", "POPULAR"),
-        Order("Updates", "LATEST"),
-        Order("A-Z", "ALPHABET"),
-        Order("New", "NEW"),
-        Order("Completed", "COMPLETED"),
-    )
-
     override val supportsFilterFetching get() = true
 
-    override suspend fun fetchFilterData(): JsonElement {
-        val document = client.get("$baseUrl/search").asJsoup()
-
-        return document.select("a.genre-label")
-            .map { GenreDto(it.text(), it.attr("href").substringAfterLast("/")) }
-            .distinctBy { it.key }
-            .sortedBy { it.name }
-            .toJsonElement()
-    }
+    override suspend fun fetchFilterData(): JsonElement = fetchGraphQL<ApiGenresObject>(genresQuery).genres
+        .sortedBy { it.title }
+        .toJsonElement()
 
     override fun getFilterList(data: JsonElement?): FilterList {
-        val genres = data?.parseAs<List<GenreDto>>()
-            ?.map { Genre(it.name, it.key) }
-            .orEmpty()
+        val genres = data?.parseAs<List<ApiGenre>>().orEmpty()
 
         return FilterList(
             buildList {
                 if (genres.isNotEmpty()) {
-                    add(GenreList(genres))
+                    add(GenreFilter(genres))
                 }
-                add(OrderBy(orderBy))
+                add(OrderFilter())
+                add(HideNsfwFilter())
+                add(HideYaoiFilter())
             },
         )
     }

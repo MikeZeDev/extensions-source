@@ -1,19 +1,16 @@
 package eu.kanade.tachiyomi.extension.all.hentairox
 
-import eu.kanade.tachiyomi.multisrc.galleryadults.AdvancedTextFilter
-import eu.kanade.tachiyomi.multisrc.galleryadults.FavoriteFilter
 import eu.kanade.tachiyomi.multisrc.galleryadults.GalleryAdults
-import eu.kanade.tachiyomi.multisrc.galleryadults.Genre
-import eu.kanade.tachiyomi.multisrc.galleryadults.GenresFilter
-import eu.kanade.tachiyomi.multisrc.galleryadults.SortOrderFilter
-import eu.kanade.tachiyomi.multisrc.galleryadults.SpeechlessFilter
 import eu.kanade.tachiyomi.multisrc.galleryadults.imgAttr
-import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.source.model.FilterList
+import eu.kanade.tachiyomi.source.model.Page
+import eu.kanade.tachiyomi.source.model.SChapter
+import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.annotation.Source
-import keiyoushi.utils.firstInstanceOrNull
-import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Request
+import keiyoushi.network.Fetch
+import keiyoushi.network.get
+import keiyoushi.utils.asJsoup
+import keiyoushi.utils.parseAs
+import kotlinx.serialization.Serializable
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
@@ -23,135 +20,101 @@ abstract class HentaiRox : GalleryAdults() {
     override val mangaLang = when (lang) {
         "en" -> LANGUAGE_ENGLISH
         "ja" -> LANGUAGE_JAPANESE
-        "zh" -> LANGUAGE_CHINESE
         "all" -> LANGUAGE_MULTI
         else -> throw IllegalArgumentException("Invalid lang: $lang")
     }
 
-    override val supportsLatest = true
-    override val supportSpeechless: Boolean = true
+    override val supportSpeechless = true
 
     override val basicSearchKey = "key"
 
-    override fun Element.mangaLang() = select("a:has(.thumb_flag)").attr("href")
-        .removeSuffix("/").substringAfterLast("/")
-        .let {
-            // Include Speechless in search results
-            if (it == LANGUAGE_SPEECHLESS) mangaLang else it
-        }
+    /* List */
 
-    override fun Element.mangaTitle(selector: String): String? = mangaFullTitle(selector.takeIf { it != ".caption" } ?: ".gallery_title").let {
-        if (preferences.shortTitle) it?.shortenTitle() else it
-    }
+    override fun popularMangaSelector() = "article.hr-gallery-card"
 
-    override fun popularMangaRequest(page: Int): Request = if (mangaLang.isBlank()) {
-        // Popular browsing for LANGUAGE_MULTI
-        val url = baseUrl.toHttpUrl().newBuilder().apply {
-            addPathSegments("top-rated")
-            addPageUri(page)
-        }
-        GET(url.build(), headers)
+    override val mangaTitleSelector = ".hr-gallery-card__title"
+
+    override fun Element.mangaUrl() = selectFirst(".hr-gallery-card__cover")?.attr("abs:href")
+
+    override fun Element.mangaThumbnail() = selectFirst(".hr-gallery-card__media img")?.imgAttr()
+
+    override fun Element.mangaLang() = selectFirst(".hr-gallery-card__flag")?.attr("href")
+        .orEmpty()
+        .removeSuffix("/")
+        .substringAfterLast("/")
+
+    // The site has no language-independent popular/latest listing, so the search
+    // endpoint (sorted by popularity or by newest) covers all languages instead.
+    override val popularMangaUrl get() = if (mangaLang.isBlank()) {
+        "$baseUrl/search/?sort=popular"
     } else {
-        // Popular browsing for other languages: using source's popular page
-        super.popularMangaRequest(page)
+        super.popularMangaUrl
     }
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        // Basic search
-        val sortOrderFilter = filters.firstInstanceOrNull<SortOrderFilter>()
-        val genresFilter = filters.firstInstanceOrNull<GenresFilter>()
-        val selectedGenres = genresFilter?.state?.filter { it.state } ?: emptyList()
-        val favoriteFilter = filters.firstInstanceOrNull<FavoriteFilter>()
-
-        // Speechless
-        val speechlessFilter = filters.firstInstanceOrNull<SpeechlessFilter>()
-
-        // Advanced search
-        val advancedSearchFilters = filters.filterIsInstance<AdvancedTextFilter>()
-
-        return when {
-            favoriteFilter?.state == true ->
-                favoriteFilterSearchRequest(page, query, filters)
-            supportSpeechless && speechlessFilter?.state == true ->
-                speechlessFilterSearchRequest(page, query, filters)
-            supportAdvancedSearch && advancedSearchFilters.any { it.state.isNotBlank() } ->
-                advancedSearchRequest(page, query, filters)
-            selectedGenres.size == 1 && query.isBlank() ->
-                tagBrowsingSearchRequest(page, query, filters)
-            useIntermediateSearch ->
-                intermediateSearchRequest(page, query, filters)
-            useBasicSearch && (selectedGenres.size > 1 || query.isNotBlank()) ->
-                basicSearchRequest(page, query, filters)
-            sortOrderFilter?.state == 2 ->
-                topRatedRequest(page)
-            sortOrderFilter?.state == 1 ->
-                latestUpdatesRequest(page)
-            else ->
-                popularMangaRequest(page)
-        }
-    }
-
-    private fun topRatedRequest(page: Int): Request {
-        val url = baseUrl.toHttpUrl().newBuilder().apply {
-            addPathSegments("top-rated")
-            addPageUri(page)
-        }
-        return GET(url.build(), headers)
-    }
-
-    override fun getSortOrderURIs() = listOf(
-        Pair("Popular", "pp"),
-        Pair("Latest", "lt"),
-        Pair("Top Rated", "tr"),
-    )
-
-    /**
-     * Convert space( ) typed in search-box into plus(+) in URL. Then:
-     * - ignore the word preceding by a special character (e.g. 'school-girl' will ignore 'girl')
-     *    => replace to plus(+),
-     * - use plus(+) for separate terms, as AND condition.
-     * - use double quote(") to search for exact match.
-     */
-    override fun buildQueryString(tags: List<String>, query: String): String {
-        val regexSpecialCharacters = Regex("""[^a-zA-Z0-9"]+(?=[a-zA-Z0-9"])""")
-        return (tags + query + mangaLang).filterNot { it.isBlank() }.joinToString("+") {
-            it.trim().replace(regexSpecialCharacters, "+")
-        }
+    override val latestUpdatesUrl get() = if (mangaLang.isBlank()) {
+        "$baseUrl/search/"
+    } else {
+        super.latestUpdatesUrl
     }
 
     /* Details */
-    override fun Element.getInfo(tag: String): String = select("li:has(.tags_text:contains($tag)) a.tag")
-        .joinToString {
-            val name = it.selectFirst(".item_name")?.ownText() ?: ""
-            if (tag.contains(regexTag)) {
-                genres[name] = it.attr("href")
-                    .removeSuffix("/").substringAfterLast('/')
-            }
-            listOf(
-                name,
-                it.select(".split_tag").text()
-                    .removePrefix("| ")
-                    .trim(),
-            )
-                .filter { s -> s.isNotBlank() }
-                .joinToString()
-        }
 
-    override fun Element.getCover() = selectFirst(".left_cover img")?.imgAttr()
+    override val mangaDetailInfoSelector = ".hr-gallery-overview"
 
-    override val mangaDetailInfoSelector = ".gallery_first"
+    override fun Element.getCover() = selectFirst(".hr-gallery-cover img")?.imgAttr()
+
+    override fun getInfoSelector(tag: String) = ".hr-gallery-entity-group:has(.hr-gallery-entity-label:contains($tag)) .hr-gallery-tag"
+
+    override fun Element.infoTagName() = selectFirst(".hr-gallery-tag__name")?.text().orEmpty()
+
+    override fun Element.totalPages() = selectFirst("#js-thumbs-grid")?.attr("data-total-pages").orEmpty()
+
+    /* Related */
+
+    override suspend fun fetchRelatedMangaList(manga: SManga): List<SManga> {
+        val id = manga.url.trimEnd('/').substringAfterLast('/')
+        val html = client.get("$baseUrl/api/gallery/$id/related", xhrHeaders, Fetch.XHR)
+            .parseAs<RelatedResponse>()
+            .html
+
+        return html.asJsoup(baseUrl)
+            .select(relatedMangaSelector())
+            .searchMangaFromElements(hasNextPage = false)
+    }
 
     /* Pages */
-    override val thumbnailSelector = ".gthumb"
-    override val pageUri = "view"
 
-    /* Filters */
-    override fun tagsParser(document: Document): List<Genre> = document.select(".gtags .gallery_title a")
-        .mapNotNull {
-            Genre(
-                it.ownText(),
-                it.attr("href")
-                    .removeSuffix("/").substringAfterLast('/'),
+    override val pageUri = "g"
+
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val galleryId = chapter.url.trimEnd('/').substringAfterLast('/')
+        val document = client.get("$baseUrl/$pageUri/$galleryId/1/", Fetch.DOCUMENT).asJsoup()
+
+        val pagesJson = document.selectFirst("script#readerPagesJson")?.data()
+            ?: error("Failed to load page list")
+        val imagesUri = document.selectFirst("img#readerImg")?.imgAttr()?.substringBeforeLast('/')
+            ?: error("Failed to load page list")
+
+        return pagesJson.parseAs<List<ReaderPage>>().map {
+            Page(
+                index = it.page - 1,
+                url = "$baseUrl/$pageUri/$galleryId/${it.page}/",
+                imageUrl = "$imagesUri/${it.page}.${it.ext}",
             )
         }
+    }
+
+    /* Filters */
+
+    override fun tagsParser(document: Document) = document.select("article.hr-taxonomy-card")
+        .mapNotNull { it.selectFirst(".hr-taxonomy-card__title a") }
+        .associate {
+            it.text() to it.attr("href").removeSuffix("/").substringAfterLast('/')
+        }
+
+    @Serializable
+    private class RelatedResponse(val html: String)
+
+    @Serializable
+    private class ReaderPage(val page: Int, val ext: String)
 }

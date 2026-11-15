@@ -6,12 +6,29 @@ plugins {
 
 keiyoushi {
     name = "Bbato"
-    versionCode = 1
+    versionCode = 4
     contentWarning = ContentWarning.MIXED
-    libVersion = "1.4"
+    libVersion = "1.6"
 
     source {
         lang = "en"
-        baseUrl = "https://bbato.com"
+        baseUrl {
+            custom("https://bato1.com")
+        }
+    }
+
+    deeplink {
+        host("bato1.com")
+        host("bbato.com")
+        host("xbato.co.uk")
+        host("www.xbato.co.uk")
+        path("/manga/..*")
+        path("/read/..*")
+    }
+
+    deeplink {
+        host("mangabuddy1.co.uk")
+        host("www.mangabuddy1.co.uk")
+        path("/series/..*")
     }
 }

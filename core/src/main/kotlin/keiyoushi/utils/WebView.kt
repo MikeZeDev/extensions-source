@@ -18,7 +18,9 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import eu.kanade.tachiyomi.network.NetworkHelper
+import keiyoushi.network.Fetch
+import keiyoushi.network.fetch
+import keiyoushi.webview.internal.WebViewGlueBridge
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -28,17 +30,18 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import okhttp3.Call
+import okhttp3.Headers.Companion.toHeaders
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import uy.kohesive.injekt.Injekt
-import uy.kohesive.injekt.api.get
+import okhttp3.Response
+import java.io.ByteArrayInputStream
 import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.properties.ReadWriteProperty
 import kotlin.reflect.KProperty
@@ -62,22 +65,65 @@ class WebViewTimeoutException internal constructor(
     timeout: Duration,
 ) : Exception("Timed out waiting for WebView after $timeout")
 
+/** Lifecycle event timing for [WebViewScope.addJavaScriptOnEvent]. */
+enum class InjectionEvent(internal val value: Int) {
+    /** Execute before any script in the document executes. */
+    DOCUMENT_START(0),
+
+    /** Execute after the document has finished parsing. */
+    DOCUMENT_END(1),
+}
+
+/** Handle for removing an injected document script. */
+fun interface ScriptHandle {
+    fun remove()
+}
+
+/**
+ * The frame that sent a web message: where it came from, and how to reply to it. Its methods can be called from any
+ * thread. It belongs to the page that sent the message: when the frame navigates, calls may be dropped without an
+ * answer, so don't wait on a callback without a timeout. Have the new page send a message to get its proxy.
+ */
+interface WebMessageReplyProxy {
+    /**
+     * Origin of the sending frame (e.g. `https://example.com`), or null on the pre-Chromium 116
+     * fallback, which can't tell senders apart.
+     */
+    val sourceOrigin: String?
+
+    /** Whether the message came from the main frame, or null on the pre-Chromium 116 fallback. */
+    val isMainFrame: Boolean?
+
+    /** Posts [message] back to the frame that originated the message. */
+    fun postMessage(message: String)
+
+    /**
+     * Executes [script] specifically inside the frame that sent the message, and passes its value to [callback] as
+     * JSON text. A failed script or a page that went away gives null, or the text `null`. Promises aren't awaited.
+     */
+    fun evaluateJs(script: String, callback: ((String?) -> Unit)? = null)
+}
+
 /**
  * DSL for configuring and driving a single [runWebView] run.
  *
- * Threading: page/navigation hooks and [poll] run on the main thread; [interceptRequest]
- * and [jsBridge] handlers run on WebView background threads. An exception thrown from any
+ * Threading: page/navigation hooks, [poll] and [webMessageBridge] handlers run on the main
+ * thread; [interceptRequest] handlers (and [webMessageBridge] handlers on the pre-Chromium 116
+ * fallback) run on WebView background threads. An exception thrown from any
  * callback fails the run via [reject].
  */
 @SuppressLint("SetJavaScriptEnabled")
 class WebViewScope<T> internal constructor(
-    private val webView: WebView,
+    internal val webView: WebView,
     private val deferred: CompletableDeferred<T>,
 ) {
     internal val pageStartedHooks = CopyOnWriteArrayList<(String) -> Unit>()
     internal val pageFinishedHooks = CopyOnWriteArrayList<(String) -> Unit>()
+
+    // Pages proxyRequest answered with a refresh to a redirect's target; the page hooks skip them
+    internal val refreshPages: MutableSet<String> = ConcurrentHashMap.newKeySet()
     internal val receivedErrorHooks = CopyOnWriteArrayList<(WebResourceRequest, WebResourceError) -> Unit>()
-    internal val bridgeNames = CopyOnWriteArrayList<String>()
+    private val bridgeNames = CopyOnWriteArraySet<String>()
 
     @Volatile
     internal var interceptHook: ((WebResourceRequest) -> WebResourceResponse?)? = null
@@ -106,10 +152,38 @@ class WebViewScope<T> internal constructor(
     var blockImages: Boolean by setting({ blockNetworkImage }, { blockNetworkImage = it })
     var useWideViewPort: Boolean by setting({ useWideViewPort }, { useWideViewPort = it })
     var loadWithOverviewMode: Boolean by setting({ loadWithOverviewMode }, { loadWithOverviewMode = it })
-    var userAgent: String by setting({ userAgentString }, { userAgentString = it })
 
-    /** Routes all WebView network requests through OkHttp client instead of WebView's own network stack. */
-    var useOkHttpNetwork: Boolean = false
+    /**
+     * Sets the user agent string and spoofs matching `Sec-CH-UA` client hints.
+     *
+     * Spoofing client hints requires **Chromium 119+** (`USER_AGENT_METADATA`). On older engines,
+     * only the standard user agent string is modified.
+     */
+    var userAgent: String
+        get() = webView.settings.userAgentString
+        set(value) {
+            webView.settings.userAgentString = value
+            WebViewGlueBridge.setClientHintsFromUserAgent(webView.settings, value)
+        }
+
+    /**
+     * Sends [name] with [value] on every request to an origin matching [allowedOriginRules], such as
+     * `https://example.com`, in place of any value WebView sets itself. WebView can replace a header this way, not
+     * remove it. Calling this again with the same [value] replaces its rules; with another value for a matching
+     * origin, WebView sends both, comma-separated.
+     *
+     * The header is set on the WebView's profile, so it stays for every WebView of the app until the app is closed.
+     * Requires **Chromium 142+** (`CUSTOM_REQUEST_HEADERS`, see [originMatchedHeaderSupported]). On older WebView
+     * versions it immediately fails ([reject]s).
+     */
+    fun setOriginMatchedHeader(name: String, value: String, allowedOriginRules: Set<String>) {
+        if (WebViewGlueBridge.setOriginMatchedHeader(webView, name, value, allowedOriginRules)) return
+        reject(UnsupportedOperationException("CUSTOM_REQUEST_HEADERS is not supported on this WebView (requires Chromium 142+)"))
+    }
+
+    /** Whether [setOriginMatchedHeader] is supported on this WebView. */
+    val originMatchedHeaderSupported: Boolean
+        get() = WebViewGlueBridge.isOriginMatchedHeaderSupported()
 
     /** Runs [block] on every navigation start. */
     fun onPageStarted(block: (url: String) -> Unit) {
@@ -164,19 +238,180 @@ class WebViewScope<T> internal constructor(
     }
 
     /**
-     * Exposes `window.$name.post(message)` to the page, invoking [handler] with the message.
-     * Must be called before [loadUrl]/[loadData]; interfaces added afterward are not visible
-     * to the already-loaded page.
+     * Sends one of the WebView's GETs through [client] instead and hands the response to the WebView; call it from
+     * [interceptRequest]. The request has the headers WebView passes to [interceptRequest] (WebView adds its own
+     * `X-Requested-With` later, so it isn't among them) and the [Fetch] of what it loads, both open to change in
+     * [edit], e.g. `.fetch(Fetch.SCRIPT)` for a script without a `.js` name. [client], a KeiSource client, adds the
+     * browser headers WebView would (`Sec-Fetch-*`, `Accept-Language`, `Priority`) and shares WebView's cookies.
+     *
+     * Returns null for what it leaves to the WebView: other methods, frames other than the page, stylesheets and
+     * fonts. A redirected page is loaded at its new address. The page fails the run when it can't be loaded or comes
+     * back with a status WebView refuses; error pages (4xx, 5xx) go to the WebView like any other.
      */
-    fun jsBridge(name: String, handler: (String) -> Unit) {
-        bridgeNames += name
+    fun proxyRequest(
+        request: WebResourceRequest,
+        client: OkHttpClient,
+        edit: Request.Builder.() -> Unit = {},
+    ): WebResourceResponse? {
+        // The run is over: nothing more to send
+        if (destroyed || deferred.isCompleted) return WebResourceResponse(null, null, null)
+        val call = request.toOkHttpRequest()?.apply(edit)?.build() ?: return null
+
+        // A page that fails fails the run; anything else the WebView sees as a failed load
+        fun failed(error: IOException): WebResourceResponse {
+            if (request.isForMainFrame) reject(error)
+            return WebResourceResponse(null, null, null)
+        }
+
+        val response = try {
+            // The WebView doesn't follow a redirect it is handed
+            (if (request.isForMainFrame) client.newBuilder().followRedirects(false).build() else client).newCall(call).execute()
+        } catch (e: IOException) {
+            return failed(e)
+        }
+        if (request.isForMainFrame && response.isRedirect) {
+            val target = response.header("Location")?.let { response.request.url.resolve(it) }
+            response.close()
+            target ?: return failed(IOException("HTTP ${response.code} without a location"))
+            // A page that moves on to the new address, sending no Referer, as after a redirect
+            val url = target.toString().replace("&", "&amp;").replace("\"", "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+            val html = "<meta name=\"referrer\" content=\"no-referrer\"><meta http-equiv=\"refresh\" content=\"0;url=$url\">"
+            refreshPages += request.url.toString()
+            return WebResourceResponse("text/html", "utf-8", ByteArrayInputStream(html.toByteArray()))
+        }
+        return response.toWebResourceResponse() ?: run {
+            response.close()
+            failed(IOException("HTTP ${response.code}"))
+        }
+    }
+
+    /**
+     * The OkHttp request for a WebView GET, to send through a source's own client: WebView's headers and the [Fetch]
+     * of what it loads, so a KeiSource client adds the browser headers WebView would (`Sec-Fetch-*`, `Accept-Language`,
+     * `Priority`). WebView's revalidation headers are left out; the client's own cache revalidates.
+     *
+     * Returns null for what core has no [Fetch] for: other methods, frames other than the page, stylesheets and fonts.
+     */
+    private fun WebResourceRequest.toOkHttpRequest(): Request.Builder? {
+        val headers = requestHeaders.toHeaders()
+        val fetch = proxyFetch(method, url.path.orEmpty(), headers["Accept"].orEmpty(), isForMainFrame) ?: return null
+        return Request.Builder()
+            .url(url.toString())
+            .headers(
+                headers.newBuilder()
+                    .removeAll("If-None-Match")
+                    .removeAll("If-Modified-Since")
+                    // A page the WebView was sent to, not one a page linked to
+                    .apply { if (isForMainFrame && get("Referer") == null) add("Sec-Fetch-Site", "none") }
+                    .build(),
+            )
+            .fetch(fetch)
+    }
+
+    /**
+     * The response for WebView to load, from a request the client sent for it. Drops the headers that no longer apply:
+     * the body comes decoded, and a KeiSource client's cookie jar is WebView's own. Returns null for the codes WebView
+     * refuses, redirects and 304 among them.
+     */
+    private fun Response.toWebResourceResponse(): WebResourceResponse? {
+        if (code !in 100..299 && code !in 400..599) return null
+        val type = body.contentType()
+        val kept = headers.newBuilder()
+            .removeAll("Content-Encoding")
+            .removeAll("Content-Length")
+            .removeAll("Set-Cookie")
+            .build()
+            .toMultimap()
+            .mapValues { (_, values) -> values.joinToString() }
+        return WebResourceResponse(
+            type?.let { "${it.type}/${it.subtype}" },
+            type?.charset()?.name(),
+            code,
+            // WebView refuses an empty reason phrase, which HTTP/2 responses have
+            message.ifEmpty { if (isSuccessful) "OK" else "Error" },
+            kept,
+            body.byteStream(),
+        )
+    }
+
+    /**
+     * Injects `window.$name` exposing modern, asynchronous, origin-scoped 2-way messaging.
+     * JavaScript sends: `window.$name.postMessage(message)`.
+     * JavaScript receives: `window.$name.onmessage = (event) => ...`.
+     * Must be called before [loadUrl]/[loadData]; the object is only injected on later navigations.
+     * [allowedOriginRules] entries need a scheme (e.g. `https://example.com`); WebView rejects
+     * invalid rules with [IllegalArgumentException], failing the run.
+     *
+     * With the default `*` rule, every frame on the page (including third-party iframes such as
+     * ads) can post messages. Restrict [allowedOriginRules] to the expected origin, and check
+     * [WebMessageReplyProxy.sourceOrigin]/[WebMessageReplyProxy.isMainFrame] if a message can
+     * complete the run.
+     *
+     * Requires **Chromium 116+** (`WEB_MESSAGE_ARRAY_BUFFER`) for native origin-scoped messaging.
+     * On older engines (< Chromium 116), transparently falls back to an `addJavascriptInterface`
+     * bridge exposing `window.$name.postMessage(message)` with debug logging under tag `"KeiyoushiWebView"`.
+     * Replying via [WebMessageReplyProxy] is unsupported on the fallback path and will [reject] the execution.
+     * The fallback ignores [allowedOriginRules] (every frame can post) and reports a null
+     * sender origin.
+     *
+     * [handler] runs on the main thread (on a background thread on the fallback path).
+     * [WebMessageReplyProxy.evaluateJs] additionally requires **Chromium 146+**
+     * (`JS_INJECTION_IN_FRAME_AND_WORLD`) and [reject]s otherwise.
+     *
+     * With a [worldName], the object exists only in that isolated world, not in the page's JavaScript, so the page can't
+     * see it or post through it. Scripts reach it by being injected into the same world with [addJavaScriptOnEvent]; they
+     * share the page's DOM but none of its JavaScript. Requires **Chromium 146+** (`JS_INJECTION_IN_FRAME_AND_WORLD`),
+     * with **no fallback**: it [reject]s if unsupported, as the fallback would expose the object to the page.
+     */
+    fun webMessageBridge(
+        name: String,
+        allowedOriginRules: Set<String> = setOf("*"),
+        worldName: String = "",
+        handler: (message: String, replyProxy: WebMessageReplyProxy) -> Unit,
+    ) {
+        check(bridgeNames.add(name)) { "Bridge '$name' has already been registered on this WebView" }
+        val added = WebViewGlueBridge.addWebMessageListener(
+            webView = webView,
+            jsObjectName = name,
+            allowedOriginRules = allowedOriginRules,
+            worldName = worldName,
+            onError = { reject(it) },
+        ) { message, replyProxy ->
+            if (destroyed) return@addWebMessageListener
+            try {
+                handler(message, replyProxy)
+            } catch (t: Throwable) {
+                reject(t)
+            }
+        }
+        if (added) return
+        if (worldName.isNotEmpty()) {
+            reject(UnsupportedOperationException("webMessageBridge in a world requires JS_INJECTION_IN_FRAME_AND_WORLD (Chromium 146+)"))
+            return
+        }
+
+        Log.d("KeiyoushiWebView", "Native web messaging not supported; falling back to addJavascriptInterface for '$name'")
+
+        val fallbackReplyProxy = object : WebMessageReplyProxy {
+            override val sourceOrigin: String? = null
+            override val isMainFrame: Boolean? = null
+
+            override fun postMessage(message: String) {
+                reject(UnsupportedOperationException("WebMessageReplyProxy.postMessage is not supported on this WebView (requires Chromium 116+)"))
+            }
+
+            override fun evaluateJs(script: String, callback: ((String?) -> Unit)?) {
+                reject(UnsupportedOperationException("WebMessageReplyProxy.evaluateJs is not supported on this WebView (requires Chromium 116+)"))
+            }
+        }
+
         webView.addJavascriptInterface(
             object {
                 @JavascriptInterface
-                fun post(message: String) {
+                fun postMessage(message: String) {
                     if (destroyed) return
                     try {
-                        handler(message)
+                        handler(message, fallbackReplyProxy)
                     } catch (t: Throwable) {
                         reject(t)
                     }
@@ -184,6 +419,72 @@ class WebViewScope<T> internal constructor(
             },
             name,
         )
+    }
+
+    /**
+     * Simplified [webMessageBridge] overload when reply capabilities are not needed.
+     */
+    fun webMessageBridge(
+        name: String,
+        allowedOriginRules: Set<String> = setOf("*"),
+        worldName: String = "",
+        handler: (message: String) -> Unit,
+    ) = webMessageBridge(name, allowedOriginRules, worldName) { message, _ -> handler(message) }
+
+    /**
+     * Injects [script] into matching origins before any document or inline script executes.
+     * Returns a [ScriptHandle] to cancel future injections. Must be called before
+     * [loadUrl]/[loadData]; it only applies to later navigations. Invalid [allowedOriginRules]
+     * entries (e.g. missing scheme) are rejected with [IllegalArgumentException], failing the run.
+     *
+     * Requires **Chromium 91+** (`DOCUMENT_START_SCRIPT`) for native pre-execution injection.
+     * On older engines (< Chromium 91), falls back to [onPageStarted] evaluation with debug
+     * logging under tag `"KeiyoushiWebView"`. The fallback only reaches the main frame and
+     * runs asynchronously, so page scripts (including inline ones) may already have run.
+     */
+    fun injectAtDocumentStart(
+        script: String,
+        allowedOriginRules: Set<String> = setOf("*"),
+    ): ScriptHandle {
+        val handle = WebViewGlueBridge.addDocumentStartJavaScript(webView, script, allowedOriginRules)
+        if (handle != null) {
+            return handle
+        }
+        Log.d("KeiyoushiWebView", "DOCUMENT_START_SCRIPT not supported; falling back to onPageStarted injection")
+        var cancelled = false
+        onPageStarted {
+            if (!cancelled) {
+                evaluateJs(script)
+            }
+        }
+        return ScriptHandle { cancelled = true }
+    }
+
+    /**
+     * Injects [script] on lifecycle [event] ([InjectionEvent.DOCUMENT_START] or [InjectionEvent.DOCUMENT_END]),
+     * optionally targeting an isolated [worldName]. Must be called before [loadUrl]/[loadData];
+     * it only applies to later navigations. Invalid [allowedOriginRules] entries (e.g. missing
+     * scheme) are rejected with [IllegalArgumentException], failing the run.
+     *
+     * With the default `*` rule, [script] also runs in every frame on the page, including third-party iframes such as
+     * ads, and those can use a bridge in the same world. Restrict [allowedOriginRules] to the expected origin.
+     *
+     * Requires **Chromium 146+** (`JS_INJECTION_IN_FRAME_AND_WORLD`).
+     * This method has **no fallback** on older WebView versions and immediately fails ([reject]s)
+     * if the feature is unsupported.
+     */
+    fun addJavaScriptOnEvent(
+        script: String,
+        event: InjectionEvent = InjectionEvent.DOCUMENT_START,
+        worldName: String = "",
+        allowedOriginRules: Set<String> = setOf("*"),
+    ): ScriptHandle {
+        val handle = WebViewGlueBridge.addJavaScriptOnEvent(webView, script, event.value, worldName, allowedOriginRules)
+        if (handle != null) {
+            return handle
+        }
+        reject(UnsupportedOperationException("JS_INJECTION_IN_FRAME_AND_WORLD is not supported on this WebView (requires Chromium 146+)"))
+        return ScriptHandle { }
     }
 
     /** Loads [url]. Can only be called once per scope. */
@@ -196,6 +497,24 @@ class WebViewScope<T> internal constructor(
     fun loadData(baseUrl: String, html: String, mimeType: String = "text/html") {
         markLoaded()
         webView.loadDataWithBaseURL(baseUrl, html, mimeType, "UTF-8", null)
+    }
+
+    /**
+     * Runs [block] with the run's WebView on the main thread, for what the scope has no API for: right away when
+     * called on the main thread, otherwise posted. Skipped once the run has ended; anything [block] throws fails the
+     * run via [reject]. Don't keep the view past [block], load pages or replace its clients through it. The view is
+     * never attached to a window, so `View.post` runnables don't run; schedule with a main-thread `Handler`.
+     */
+    @NativeWebViewApi
+    fun withNativeWebView(block: (WebView) -> Unit) {
+        runOnMain {
+            if (destroyed || deferred.isCompleted) return@runOnMain
+            try {
+                block(webView)
+            } catch (t: Throwable) {
+                reject(t)
+            }
+        }
     }
 
     /** Runs [script], optionally passing its JSON-encoded result to [callback]. */
@@ -274,19 +593,13 @@ private class ScopeWebViewClient(
     private val scope: WebViewScope<*>,
 ) : WebViewClient() {
 
-    private val client: OkHttpClient by lazy {
-        Injekt.get<NetworkHelper>().client.newBuilder().apply {
-            interceptors().removeAll { it.javaClass.simpleName == "CloudflareInterceptor" }
-        }.build()
-    }
-
     override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-        if (scope.destroyed) return
+        if (scope.destroyed || url in scope.refreshPages) return
         scope.pageStartedHooks.forEach { it(url.orEmpty()) }
     }
 
     override fun onPageFinished(view: WebView?, url: String?) {
-        if (scope.destroyed) return
+        if (scope.destroyed || scope.refreshPages.remove(url)) return
         scope.pageFinishedHooks.forEach { it(url.orEmpty()) }
     }
 
@@ -295,106 +608,7 @@ private class ScopeWebViewClient(
         request: WebResourceRequest?,
     ): WebResourceResponse? {
         if (scope.destroyed || request == null) return null
-        val hooked = scope.interceptHook?.invoke(request)
-        if (hooked != null) return hooked
-        if (scope.useOkHttpNetwork) return fetchFromOkHttp(request)
-        return null
-    }
-
-    private fun fetchFromOkHttp(request: WebResourceRequest): WebResourceResponse? {
-        if (request.method !in NO_BODY_METHODS) return null
-        if (request.url.scheme != "https" && request.url.scheme != "http") return null
-
-        val okhttpRequest = Request.Builder().apply {
-            url(request.url.toString())
-            method(request.method, null)
-            request.requestHeaders.forEach { (key, value) ->
-                if (key == "X-Requested-With" && value == applicationContext.packageName) {
-                    return@forEach
-                }
-                if (key.startsWith("Sec-CH-UA", ignoreCase = true)) {
-                    return@forEach
-                }
-                header(key, value)
-            }
-            clientHints(request.requestHeaders["User-Agent"]).forEach { (key, value) ->
-                header(key, value)
-            }
-        }.build()
-
-        return try {
-            val response = client.newCall(okhttpRequest).execute()
-            val body = response.body
-            val contentType = body.contentType()
-            WebResourceResponse(
-                contentType?.let { "${it.type}/${it.subtype}" } ?: "application/octet-stream",
-                contentType?.charset()?.name() ?: "UTF-8",
-                response.code,
-                response.message.ifEmpty { "OK" },
-                response.headers.toMap()
-                    .filterKeys { !it.equals("Content-Encoding", true) && !it.equals("Content-Length", true) },
-                body.byteStream(),
-            )
-        } catch (_: IOException) {
-            null
-        }
-    }
-
-    private fun clientHints(userAgent: String?): Map<String, String> {
-        userAgent ?: return emptyMap()
-        val (name, version, chromiumVersion) = when {
-            userAgent.contains("Firefox/") && !userAgent.contains("Chrome") -> return emptyMap()
-
-            userAgent.contains("Safari/") &&
-                !userAgent.contains("Chrome") &&
-                !userAgent.contains("Chromium") -> return emptyMap()
-
-            userAgent.contains("Edg/") || userAgent.contains("EdgA/") || userAgent.contains("EdgiOS/") -> {
-                val edgeVersion = EDGE_REGEX.find(userAgent)?.groupValues?.get(1) ?: "134"
-                val chromiumVersion = CHROME_REGEX.find(userAgent)?.groupValues?.get(1) ?: edgeVersion
-                Triple("Microsoft Edge", edgeVersion, chromiumVersion)
-            }
-
-            userAgent.contains("OPR/") -> {
-                val operaVersion = OPERA_REGEX.find(userAgent)?.groupValues?.get(1) ?: "118"
-                val chromiumVersion = CHROME_REGEX.find(userAgent)?.groupValues?.get(1) ?: "134"
-                Triple("Opera", operaVersion, chromiumVersion)
-            }
-
-            userAgent.contains("Chrome/") -> {
-                val chromeVersion = CHROME_REGEX.find(userAgent)?.groupValues?.get(1) ?: "134"
-                Triple("Google Chrome", chromeVersion, chromeVersion)
-            }
-
-            else -> return emptyMap()
-        }
-
-        val isMobile = userAgent.contains("Mobile") ||
-            userAgent.contains("Android") ||
-            userAgent.contains("iPhone") ||
-            userAgent.contains("iPad")
-
-        val platform = when {
-            userAgent.contains("Windows") -> "\"Windows\""
-            userAgent.contains("Android") -> "\"Android\""
-            userAgent.contains("iPhone") || userAgent.contains("iPad") -> "\"iOS\""
-            userAgent.contains("Macintosh") || userAgent.contains("Mac OS X") -> "\"macOS\""
-            userAgent.contains("Linux") -> "\"Linux\""
-            else -> "\"Windows\""
-        }
-
-        return mapOf(
-            "Sec-CH-UA" to "\"$name\";v=\"$version\", \"Chromium\";v=\"$chromiumVersion\", \"Not A(Brand\";v=\"24\"",
-            "Sec-CH-UA-Mobile" to if (isMobile) "?1" else "?0",
-            "Sec-CH-UA-Platform" to platform,
-        )
-    }
-
-    private companion object {
-        val CHROME_REGEX = Regex("""Chrome/(\d+)""")
-        val EDGE_REGEX = Regex("""Edg[^/]*/(\d+)""")
-        val OPERA_REGEX = Regex("""OPR/(\d+)""")
-        val NO_BODY_METHODS = setOf("GET", "HEAD", "OPTIONS")
+        return scope.interceptHook?.invoke(request)
     }
 
     override fun onReceivedError(
@@ -436,53 +650,6 @@ private class LoggingWebChromeClient : WebChromeClient() {
     }
 }
 
-/**
- * Reuses one WebView across multiple [runWebView] calls, destroying it after [idleTimeout]
- * of inactivity. Concurrent [runWebView] calls sharing a session are serialized via [mutex].
- * [obtain] and [release] are only ever called on the main thread by [runWebView].
- */
-class WebViewSession(private val idleTimeout: Duration = 30.seconds) {
-    internal val mutex = Mutex()
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private var webView: WebView? = null
-    private var destroyTask: Runnable? = null
-
-    internal fun obtain(): WebView {
-        destroyTask?.let(mainHandler::removeCallbacks)
-        destroyTask = null
-        return webView ?: WebView(applicationContext).also { webView = it }
-    }
-
-    internal fun release(dead: Boolean) {
-        val current = webView ?: return
-        if (dead) {
-            current.destroy()
-            webView = null
-            return
-        }
-        current.webViewClient = WebViewClient()
-        current.webChromeClient = null
-        current.loadUrl("about:blank")
-        val task = Runnable {
-            webView?.destroy()
-            webView = null
-            destroyTask = null
-        }
-        destroyTask = task
-        mainHandler.postDelayed(task, idleTimeout.inWholeMilliseconds)
-    }
-
-    /** Immediately destroys the underlying WebView, if any. */
-    fun destroy() {
-        mainHandler.post {
-            destroyTask?.let(mainHandler::removeCallbacks)
-            destroyTask = null
-            webView?.destroy()
-            webView = null
-        }
-    }
-}
-
 @SuppressLint("SetJavaScriptEnabled")
 private fun setupWebView(webView: WebView) {
     webView.settings.apply {
@@ -491,8 +658,9 @@ private fun setupWebView(webView: WebView) {
         blockNetworkImage = false
         useWideViewPort = false
         loadWithOverviewMode = false
-        userAgentString = null
     }
+
+    WebViewGlueBridge.setAudioMuted(webView, true)
 
     runCatching {
         val metrics = Resources.getSystem().displayMetrics
@@ -505,49 +673,57 @@ private fun setupWebView(webView: WebView) {
     }
 }
 
+/** The [Fetch] a proxied WebView request goes out as, or null for one proxyRequest leaves to the WebView. */
+internal fun proxyFetch(method: String, path: String, accept: String, isForMainFrame: Boolean): Fetch? {
+    val name = path.lowercase()
+    // Chromium's Accept for a navigation, not a script's text/html fetch
+    val frame = !isForMainFrame && accept.startsWith("text/html,application/xhtml+xml")
+    if (method != "GET" || frame || accept.startsWith("text/css") || FONT_EXTENSIONS.any(name::endsWith)) return null
+    return when {
+        isForMainFrame -> Fetch.DOCUMENT
+        SCRIPT_EXTENSIONS.any(name::endsWith) -> Fetch.SCRIPT
+        accept.startsWith("image/") -> Fetch.IMAGE
+        else -> Fetch.XHR
+    }
+}
+
+private val SCRIPT_EXTENSIONS = listOf(".js", ".mjs")
+
+private val FONT_EXTENSIONS = listOf(".woff2", ".woff", ".ttf", ".otf")
+
 /**
  * Runs a WebView with [configure], suspending until it calls `resolve`/`reject` or [timeout]
- * elapses. Pass [session] to reuse a WebView across calls instead of spinning up a new one.
- * The WebView is torn down (or returned to [session]) whether this returns, throws, or is
- * canceled.
+ * elapses. The WebView is torn down whether this returns, throws, or is canceled.
  */
 suspend fun <T> runWebView(
-    session: WebViewSession? = null,
     timeout: Duration = 30.seconds,
     configure: WebViewScope<T>.() -> Unit,
-): T {
-    suspend fun execute(): T = withContext(Dispatchers.Main) {
-        val deferred = CompletableDeferred<T>()
-        val webView = session?.obtain() ?: WebView(applicationContext)
-        setupWebView(webView)
-        val scope = WebViewScope(webView, deferred)
-        webView.webViewClient = ScopeWebViewClient(scope)
-        webView.webChromeClient = LoggingWebChromeClient()
+): T = withContext(Dispatchers.Main) {
+    val deferred = CompletableDeferred<T>()
+    val webView = WebView(applicationContext)
+    setupWebView(webView)
+    val scope = WebViewScope(webView, deferred)
+    webView.webViewClient = ScopeWebViewClient(scope)
+    webView.webChromeClient = LoggingWebChromeClient()
+    try {
         try {
-            try {
-                scope.configure()
-            } catch (t: Throwable) {
-                deferred.completeExceptionally(t)
-            }
-            try {
-                withTimeout(timeout) {
-                    deferred.await()
-                }
-            } catch (_: TimeoutCancellationException) {
-                throw WebViewTimeoutException(timeout)
-            }
-        } finally {
-            scope.destroyed = true
-            webView.stopLoading()
-            if (session != null) {
-                scope.bridgeNames.forEach(webView::removeJavascriptInterface)
-                session.release(dead = scope.renderDead)
-            } else {
-                webView.destroy()
-            }
+            scope.configure()
+        } catch (t: Throwable) {
+            deferred.completeExceptionally(t)
         }
+        try {
+            withTimeout(timeout) {
+                deferred.await()
+            }
+        } catch (_: TimeoutCancellationException) {
+            throw WebViewTimeoutException(timeout)
+        }
+    } finally {
+        scope.destroyed = true
+        runCatching { (webView.parent as? ViewGroup)?.removeView(webView) }
+        webView.stopLoading()
+        webView.destroy()
     }
-    return session?.mutex?.withLock { execute() } ?: execute()
 }
 
 /**
@@ -559,7 +735,6 @@ suspend fun <T> runWebView(
  */
 fun <T> runWebViewBlocking(
     call: Call,
-    session: WebViewSession? = null,
     timeout: Duration = 30.seconds,
     configure: WebViewScope<T>.() -> Unit,
 ): T {
@@ -578,7 +753,7 @@ fun <T> runWebViewBlocking(
                 }
             }
             try {
-                runWebView(session, timeout, configure)
+                runWebView(timeout, configure)
             } finally {
                 watcher.cancel()
             }
@@ -598,5 +773,11 @@ suspend fun getLocalStorage(url: String, key: String): String? = runWebView(time
             resolve(value.parseAs<String?>())
         }
     }
-    loadData(url, "")
+    loadData(url, """<link rel="icon" href="data:,">""")
 }
+
+/** Marks [WebViewScope.withNativeWebView]. Prefer the scope's own API where it has one. */
+@RequiresOptIn(message = "Avoid depending on native WebView")
+@Retention(AnnotationRetention.BINARY)
+@Target(AnnotationTarget.FUNCTION)
+annotation class NativeWebViewApi

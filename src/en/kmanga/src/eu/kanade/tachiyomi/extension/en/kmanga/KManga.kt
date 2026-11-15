@@ -11,10 +11,12 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
 import keiyoushi.network.get
 import keiyoushi.network.post
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.firstInstance
+import keiyoushi.utils.getLocalStorage
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import kotlinx.serialization.json.JsonElement
@@ -44,8 +46,16 @@ abstract class KManga :
         addInterceptor { chain ->
             val request = chain.request()
             val response = chain.proceed(request)
-            if (response.code == 400 && request.url.pathSegments.last().contains("viewer")) {
-                throw IOException("Log in via WebView and rent or purchase this chapter to read.")
+            if (response.code == 400) {
+                response.close()
+                val error = if (request.url.pathSegments.last().contains("viewer")) {
+                    "Log in via WebView and rent or purchase this chapter to read."
+                } else {
+                    reloadUserId = true
+                    "Open WebView and retry"
+                }
+
+                throw IOException(error)
             }
             response
         }
@@ -60,7 +70,7 @@ abstract class KManga :
             .addQueryParameter("limit", (pageLimit + 1).toString())
             .build()
 
-        val rankingResult = hashedGet(url).parseAs<RankingApiResponse>()
+        val rankingResult = hashedReq(url).parseAs<RankingApiResponse>()
         val titleIds = rankingResult.rankingTitleList.map { it.id.toString() }
         if (titleIds.isEmpty()) {
             return MangasPage(emptyList(), false)
@@ -72,14 +82,14 @@ abstract class KManga :
             .addQueryParameter("title_id_list", mangaIdsToFetch.joinToString(","))
             .build()
 
-        val result = hashedGet(detailsUrl).parseAs<TitleListResponse>()
+        val result = hashedReq(detailsUrl).parseAs<TitleListResponse>()
         val mangas = result.titleList.map { it.toSManga() }
         return MangasPage(mangas, hasNextPage)
     }
 
     // Latest
     override suspend fun getLatestUpdates(page: Int): MangasPage {
-        val result = hashedGet("$apiUrl/title/weekly".toHttpUrl()).parseAs<LatestResponse>()
+        val result = hashedReq("$apiUrl/title/weekly".toHttpUrl()).parseAs<LatestResponse>()
         val todayIdList = result.weeklyList.first { it.weekdayIndex == result.todayWeekdayIndex }.titleIdList
         val titleById = result.titleList.associateBy { it.titleId }
         val mangas = todayIdList.mapNotNull { titleById[it]?.toSManga() }
@@ -102,7 +112,7 @@ abstract class KManga :
                 .build()
         }
 
-        val result = hashedGet(url).parseAs<TitleListResponse>()
+        val result = hashedReq(url).parseAs<TitleListResponse>()
         val mangas = result.titleList.map { it.toSManga() }
         return MangasPage(mangas, false)
     }
@@ -122,7 +132,7 @@ abstract class KManga :
         val url = "$apiUrl/genre/list".toHttpUrl().newBuilder()
             .addQueryParameter("genre_id_list", genreIds.joinToString())
             .build()
-        return hashedGet(url).parseAs<GenreListResponse>().genreList?.joinToString { it.genreName }
+        return hashedReq(url).parseAs<GenreListResponse>().genreList?.joinToString { it.genreName }
     }
 
     override suspend fun fetchMangaUpdate(
@@ -137,7 +147,7 @@ abstract class KManga :
             .addQueryParameter("title_id", titleId)
             .build()
 
-        val webTitle = hashedGet(url).parseAs<DetailResponse>().webTitle
+        val webTitle = hashedReq(url).parseAs<DetailResponse>().webTitle
         val genre = webTitle.genreIdList?.takeIf { it.isNotEmpty() }?.let { fetchGenreNames(it) }
 
         val updatedChapters = if (fetchChapters) {
@@ -145,18 +155,10 @@ abstract class KManga :
             if (episodeIds.isEmpty()) {
                 emptyList()
             } else {
-                val (birthday, expires) = getBirthdayCookie(url)
                 val formBody = FormBody.Builder()
                     .add("episode_id_list", episodeIds.joinToString(","))
                     .build()
-
-                val params = (0 until formBody.size).associate { formBody.name(it) to formBody.value(it) }
-                val hash = generateHash(params, birthday, expires)
-                val newHeaders = headersBuilder()
-                    .add("X-Kmanga-Hash", hash)
-                    .build()
-
-                val result = client.post("$apiUrl/episode/list", newHeaders, formBody).parseAs<EpisodeListResponse>()
+                val result = hashedReq("$apiUrl/episode/list".toHttpUrl(), formBody).parseAs<EpisodeListResponse>()
 
                 result.episodeList
                     .filter { !hideLocked || !it.isLocked }
@@ -182,7 +184,7 @@ abstract class KManga :
             .addQueryParameter("episode_id", episodeId)
             .build()
 
-        val result = hashedGet(url).parseAs<ViewerApiResponse>()
+        val result = hashedReq(url).parseAs<ViewerApiResponse>()
         return result.pageList.mapIndexed { index, page ->
             Page(index, imageUrl = "$page#${result.scrambleSeed}:${result.titleId}:${result.episodeId}")
         }
@@ -226,14 +228,43 @@ abstract class KManga :
         return "${keyHash}_$valueHash"
     }
 
-    private suspend fun hashedGet(url: HttpUrl): Response {
+    private var userId: Int? = null
+    private var reloadUserId = false
+
+    private suspend fun hashedReq(url: HttpUrl, body: FormBody? = null): Response {
+        if (reloadUserId || userId == null) setUserId()
+
         val (birthday, expires) = getBirthdayCookie(url)
-        val queryParams = url.queryParameterNames.associateWith { url.queryParameter(it)!! }
-        val hash = generateHash(queryParams, birthday, expires)
+        val params = if (body != null) {
+            (0 until body.size).associate { body.name(it) to body.value(it) }
+        } else {
+            url.queryParameterNames.associateWith {
+                url.queryParameter(it)!!
+            }
+        }
+
+        val hash = generateHash(params, birthday, expires)
         val newHeaders = headersBuilder()
+            .add("x-kmanga-client-id", userId.toString())
+            .add("x-kmanga-is-crawler", "false")
             .add("X-Kmanga-Hash", hash)
             .build()
-        return client.get(url, newHeaders)
+
+        return if (body != null) {
+            client.post(url, newHeaders, Fetch.XHR, body)
+        } else {
+            client.get(url, newHeaders, Fetch.XHR)
+        }
+    }
+
+    private suspend fun setUserId() {
+        reloadUserId = false
+        val account = getLocalStorage(baseUrl, "account")?.parseAs<LocalStorageAccount>()
+        userId = if (account?.isLoggedIn == true) {
+            account.checkedTicketExpiredList?.firstOrNull()?.userId ?: 0
+        } else {
+            0
+        }
     }
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {

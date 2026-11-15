@@ -1,27 +1,32 @@
 package eu.kanade.tachiyomi.extension.ar.yonabar
 
 import eu.kanade.tachiyomi.multisrc.madara.Madara
-import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import keiyoushi.annotation.Source
-import okhttp3.Response
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.jsoup.nodes.Document
 
 @Source
 abstract class YonaBar : Madara() {
-
-    override val useLoadMoreRequest = LoadMoreStrategy.Never
     override val mangaSubString = "yaoi"
 
-    // The next page has an error; it’s a site issue
-    override fun popularMangaParse(response: Response): MangasPage = super.popularMangaParse(response).copy(hasNextPage = false)
+    override val chapterDateSelector = ".chapter-release-date .timediff"
 
-    override fun latestUpdatesParse(response: Response): MangasPage = super.latestUpdatesParse(response).copy(hasNextPage = false)
+    override val pageListParseSelector = ".reading-content img:not(#image-0\\.0)"
 
-    override fun pageListParse(document: Document): List<Page> = super.pageListParse(document)
-        .map { page ->
-            page.apply {
-                imageUrl = imageUrl!!.replaceFirst("medium1", "medium1x")
-            }
+    override fun parsePages(document: Document): List<Page> {
+        // Image hosts the site's reader swaps in
+        val hosts = document.select("script:containsData(.wp-manga-chapter-img)")
+            .flatMap { hostReplaceRegex.findAll(it.data()) }
+            .associate { it.groupValues[1] to it.groupValues[2] }
+
+        return super.parsePages(document).onEach { page ->
+            val url = page.imageUrl!!.toHttpUrl()
+            hosts[url.host]?.let { page.imageUrl = url.newBuilder().host(it).build().toString() }
         }
+    }
+
+    companion object {
+        private val hostReplaceRegex = Regex("""src\.replace\("([^"]+)",\s*"([^"]+)"\)""")
+    }
 }

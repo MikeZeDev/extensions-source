@@ -6,9 +6,9 @@ plugins {
 
 keiyoushi {
     name = "Soft Epsilon Scan"
-    versionCode = 52
-    contentWarning = ContentWarning.SAFE
-    libVersion = "1.4"
+    versionCode = 0
+    contentWarning = ContentWarning.MIXED
+    libVersion = "1.6"
     theme = "pam"
 
     source {

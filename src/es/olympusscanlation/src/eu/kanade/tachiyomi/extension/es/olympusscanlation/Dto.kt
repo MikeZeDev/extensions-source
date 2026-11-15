@@ -2,10 +2,10 @@ package eu.kanade.tachiyomi.extension.es.olympusscanlation
 
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
+import keiyoushi.utils.tryParse
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
-import java.text.ParseException
-import java.text.SimpleDateFormat
+import kotlin.time.Instant
 
 @Serializable
 class RankingDto(
@@ -107,27 +107,17 @@ class PayloadChapterDto(var data: List<ChapterDto>, val meta: MetaDto)
 class ChapterDto(
     private val id: Int,
     private val name: String,
-    @SerialName("published_at") private val date: String,
+    @SerialName("published_at") private val date: String?,
 ) {
-    fun toSChapter(mangaId: String, dateFormat: SimpleDateFormat) = SChapter.create().apply {
+    fun toSChapter(mangaId: String) = SChapter.create().apply {
         name = "Capitulo ${this@ChapterDto.name}"
         url = "$mangaId/$id"
-        date_upload = try {
-            dateFormat.parse(date)!!.time
-        } catch (e: ParseException) {
-            0L
-        }
+        date_upload = Instant.tryParse(date)
     }
 }
 
 @Serializable
 class MetaDto(val total: Int)
-
-@Serializable
-class PayloadPagesDto(val chapter: PageDto)
-
-@Serializable
-class PageDto(val pages: List<String>)
 
 @Serializable
 class MangaStatusDto(

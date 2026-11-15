@@ -2,19 +2,10 @@ package eu.kanade.tachiyomi.extension.ja.ynjn
 
 import eu.kanade.tachiyomi.source.model.Filter
 
-class CategoryFilter :
+class CategoryFilter(labels: List<Label>) :
     SelectFilter(
         "Category",
-        arrayOf(
-            // Label
-            Triple("ウルトラジャンプ", "LABEL", "9"),
-            Triple("ヤングジャンプ", "LABEL", "10"),
-            Triple("グランドジャンプ", "LABEL", "15"),
-            Triple("ヤンジャン＋オリジナル作品", "LABEL", "17"),
-            Triple("異世界ヤンジャン", "LABEL", "20"),
-            Triple("となりのヤングジャンプ", "LABEL", "21"),
-            Triple("キャプテン翼WORLD", "LABEL", "22"),
-            Triple("本宮ひろ志漫画大全集", "LABEL", "23"),
+        labels.map { Triple(it.name, "LABEL", it.id.toString()) }.toTypedArray() + arrayOf(
             // Genre
             Triple("バトル", "GENRE", "1"),
             Triple("アクション", "GENRE", "2"),

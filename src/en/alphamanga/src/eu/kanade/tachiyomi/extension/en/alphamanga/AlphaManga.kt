@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.extension.en.alphamanga
 
+import android.util.Base64
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.source.ConfigurableSource
@@ -10,18 +11,21 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
-import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
 import keiyoushi.network.get
 import keiyoushi.source.KeiSource
+import keiyoushi.utils.asJsoup
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
+import keiyoushi.utils.readUShortLittleEndian
 import keiyoushi.utils.string
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.serialization.json.JsonElement
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.OkHttpClient
 
 @Source
 abstract class AlphaManga :
@@ -29,6 +33,8 @@ abstract class AlphaManga :
     ConfigurableSource {
     override val supportsLatest = false
     private val preferences by getPreferencesLazy()
+
+    override fun OkHttpClient.Builder.configureClient() = addInterceptor(ImageInterceptor())
 
     override suspend fun getPopularManga(page: Int): MangasPage = getSearchMangaList(page, "", FilterList())
 
@@ -41,7 +47,7 @@ abstract class AlphaManga :
             .addQueryParameter("genre", genre)
             .addQueryParameter("page", page.toString())
             .build()
-        val result = client.get(url).parseAs<SearchResponse>()
+        val result = client.get(url, Fetch.XHR).parseAs<SearchResponse>()
         val mangas = result.data.map { it.toSManga() }
         return MangasPage(mangas, result.hasMore)
     }
@@ -55,7 +61,7 @@ abstract class AlphaManga :
         val hideLocked = preferences.getBoolean(HIDE_LOCKED_PREF_KEY, false)
         val mangas = async {
             if (!fetchDetails) return@async manga
-            val document = client.get(getMangaUrl(manga), desktopHeaders).asJsoup()
+            val document = client.get(getMangaUrl(manga), desktopHeaders, Fetch.DOCUMENT).asJsoup()
             SManga.create().apply {
                 title = document.selectFirst("h1.c-h1")!!.text()
                 author = document.select("h3.p-manga-detail__about-label")
@@ -78,7 +84,7 @@ abstract class AlphaManga :
 
         val chapterList = async {
             if (!fetchChapters) return@async chapters
-            client.get("$baseUrl/manga/${manga.url}/episodes.json").parseAs<ChapterResponse>().episodes
+            client.get("$baseUrl/manga/${manga.url}/episodes.json", Fetch.XHR).parseAs<ChapterResponse>().episodes
                 .filter { !hideLocked || !it.isLocked }
                 .map { it.toSChapter(manga.url) }
         }
@@ -100,12 +106,33 @@ abstract class AlphaManga :
         .build()
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
-        val document = client.get(getChapterUrl(chapter), mobileHeaders).asJsoup()
-        val manga = document.selectFirst("viewer-manga-vertical")?.attr("v-bind:pages") ?: throw Exception("Log in via WebView and rent or purchase this chapter to read.")
-        val pages = manga.parseAs<List<String>>()
+        val document = client.get(getChapterUrl(chapter), mobileHeaders, Fetch.DOCUMENT).asJsoup()
+        val viewer = document.selectFirst("viewer-manga-vertical") ?: throw Exception("Log in via WebView and rent or purchase this chapter to read.")
+
+        val pages = viewer.attr("v-bind:pages").parseAs<List<String>>()
+        val keys = viewer.attr("placeholder").extractKeys()
+
         return pages.filterNot { it == "first" || it == "last" }.mapIndexed { index, url ->
-            Page(index, imageUrl = url)
+            val keyEncoded = Base64.encodeToString(keys[index], Base64.NO_WRAP)
+            Page(index, imageUrl = "$url#key=$keyEncoded")
         }
+    }
+
+    private fun String.extractKeys(): List<ByteArray> {
+        val raw = Base64.decode(substringAfter("base64,"), Base64.DEFAULT)
+
+        val keys = mutableListOf<ByteArray>()
+        var pos = 33 // right after the PNG signature + IHDR chunk
+        while (pos + 2 <= raw.size) {
+            val count = raw.readUShortLittleEndian(pos)
+            val length = count * 8
+            val dataStart = pos + 2
+            val dataEnd = dataStart + length
+            if (dataEnd > raw.size) break
+            keys.add(raw.copyOfRange(dataStart, dataEnd))
+            pos = dataEnd
+        }
+        return keys
     }
 
     override fun getFilterList(data: JsonElement?) = FilterList(

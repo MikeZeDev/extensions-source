@@ -8,15 +8,10 @@ keiyoushi {
     name = "Comic Grast"
     versionCode = 1
     contentWarning = ContentWarning.SAFE
-    libVersion = "1.4"
+    libVersion = "1.6"
 
     source {
         lang = "ja"
         baseUrl = "https://novema.jp"
     }
-}
-
-dependencies {
-
-    implementation(project(":lib:seedrandom"))
 }

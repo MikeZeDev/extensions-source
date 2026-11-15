@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.extension.all.mangafire
 
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
+import keiyoushi.utils.toMarkdown
 import kotlinx.serialization.Serializable
 import org.jsoup.Jsoup
 
@@ -61,7 +62,7 @@ class MangaDetailsDto(
         thumbnail_url = poster?.large ?: poster?.medium ?: poster?.small
         author = authors?.joinToString { it.title }
         artist = artists?.joinToString { it.title }
-        description = synopsisHtml?.let { Jsoup.parseBodyFragment(it).text() }
+        description = synopsisHtml?.let { Jsoup.parseBodyFragment(it).body().toMarkdown() }
         genre = buildList {
             type?.replaceFirstChar { it.uppercase() }?.let { add(it) }
             genres?.forEach { add(it.title) }
@@ -116,17 +117,22 @@ class ChapterDto(
 ) {
     fun toSChapter(mangaUrl: String, langCode: String): SChapter = SChapter.create().apply {
         url = "$mangaUrl/$id-chapter-${number.toString().removeSuffix(".0")}-$langCode"
-        chapter_number = number
-        name = buildString {
-            append("Ch. ")
-            append(number.toString().removeSuffix(".0"))
-            if (!this@ChapterDto.name.isNullOrBlank()) {
-                append(" - ")
-                append(this@ChapterDto.name)
+        when {
+            this@ChapterDto.name.isNullOrBlank() -> number to "Ch. ${number.toString().removeSuffix(".0")}"
+            else -> when (val extractedNumber = chapterRegex.find(this@ChapterDto.name)?.value?.toFloatOrNull()) {
+                null -> number to "Ch. ${number.toString().removeSuffix(".0")} - ${this@ChapterDto.name}"
+                else -> extractedNumber to this@ChapterDto.name
             }
+        }.let { (a, b) ->
+            chapter_number = a
+            name = b
         }
         scanlator = type ?: "Unknown"
         date_upload = createdAt?.times(1000L) ?: 0L
+    }
+
+    companion object {
+        private val chapterRegex = """(?<=\b(?:ch(?:\.|apter)?|ep(?:\.|isode)?)\s?)\d+(?:\.\d+)?""".toRegex(RegexOption.IGNORE_CASE)
     }
 }
 

@@ -6,9 +6,9 @@ plugins {
 
 keiyoushi {
     name = "NovelCrow"
-    versionCode = 1
+    versionCode = 2
     contentWarning = ContentWarning.NSFW
-    libVersion = "1.4"
+    libVersion = "1.6"
     theme = "madara"
 
     source {

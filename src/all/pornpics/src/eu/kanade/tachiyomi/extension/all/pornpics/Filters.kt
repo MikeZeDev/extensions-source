@@ -3,132 +3,93 @@ package eu.kanade.tachiyomi.extension.all.pornpics
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import keiyoushi.lib.i18n.Intl
-import java.util.Locale
 
-class Filters {
+class SortSelector(name: String, values: Array<String>) : Filter.Select<String>(name, values) {
+    val isRecent get() = state == 1
+}
 
-    data class SortOption(val name: String, val urlPart: String? = null) {
-        override fun toString() = this.name
+enum class CategoryType {
+    CATEGORY,
+    TAG,
+    PORN_STAR,
+    CHANNEL,
+}
+
+data class CategoryOption(val name: String, val type: CategoryType, val urlPart: String) {
+    override fun toString() = this.name
+}
+
+data class ActiveCategoryOption(val name: String, val categoryType: CategoryType) {
+    override fun toString() = this.name
+}
+
+class ActiveCategoryTypeSelector(name: String, values: Array<ActiveCategoryOption>) : Filter.Select<ActiveCategoryOption>(name, values) {
+    fun selectedCategoryOption(filters: FilterList): CategoryOption? {
+        val selected = values.getOrNull(state)?.categoryType ?: return null
+        return filters.filterIsInstance<CategorySelector>()
+            .firstOrNull { it.type == selected }
+            ?.selected()
     }
+}
 
-    class SortSelector(name: String, private val vals: Array<SortOption>) : Filter.Select<SortOption>(name, vals) {
-        fun toUriPart() = vals[state].urlPart
-    }
+class CategorySelector(name: String, val type: CategoryType, values: Array<CategoryOption>) : Filter.Select<CategoryOption>(name, values) {
+    fun selected() = values.getOrNull(state)
+}
 
-    enum class CategoryType {
-        RECOMMEND,
-        CATEGORY,
-        TAG,
-        PORN_STAR,
-        CHANNEL,
-        ;
+fun createSortSelector(intl: Intl) = SortSelector(
+    intl["filter.time.title"],
+    arrayOf(
+        intl["filter.time.option.popular"],
+        intl["filter.time.option.recent"],
+    ),
+)
 
-        companion object {
-            private val mNameToCategoryType = CategoryType.values().associateBy { it.name.lowercase(Locale.US) }
+fun createActiveCategoryTypeSelector(intl: Intl) = ActiveCategoryTypeSelector(
+    intl["filter.active-category-type.title"],
+    arrayOf(
+        ActiveCategoryOption(intl["filter.active-category-type.option.categories"], CategoryType.CATEGORY),
+        ActiveCategoryOption(intl["filter.active-category-type.option.tags"], CategoryType.TAG),
+        ActiveCategoryOption(intl["filter.active-category-type.option.porn-star"], CategoryType.PORN_STAR),
+        ActiveCategoryOption(intl["filter.active-category-type.option.channels"], CategoryType.CHANNEL),
+    ),
+)
 
-            fun of(name: String) = mNameToCategoryType[name.lowercase(Locale.US)]!!
-        }
-    }
+internal class NetworkFilters(
+    private val intl: Intl,
+    private val data: FilterData,
+) {
+    fun createCategorySelector(): CategorySelector? = createSelector(
+        data.categories,
+        intl["filter.category-type.categories.title"],
+        CategoryType.CATEGORY,
+    )
 
-    data class CategoryOption(val name: String, val type: CategoryType, val urlPart: String) {
-        override fun toString() = this.name
-        fun toUrlPart() = urlPart
-        fun useSearch() = urlPart.contains("/search/srch.php?")
-    }
+    fun createTagSelector(): CategorySelector? = createSelector(
+        data.tags,
+        intl["filter.category-type.tags.title"],
+        CategoryType.TAG,
+    )
 
-    data class ActiveCategoryOption(val name: String, val categoryType: CategoryType?) {
-        override fun toString() = this.name
-    }
+    fun createPornStarSelector(): CategorySelector? = createSelector(
+        data.pornStars,
+        intl["filter.category-type.porn-star.title"],
+        CategoryType.PORN_STAR,
+    )
 
-    class ActiveCategoryTypeSelector(name: String, values: Array<ActiveCategoryOption>) : Filter.Select<ActiveCategoryOption>(name, values) {
-        fun selected() = values[state].categoryType!!
-        fun selectedCategoryOption(filters: FilterList): CategoryOption {
-            val selectors = filters.filterIsInstance<CategorySelector>()
-            val selected = selected()
-            return selectors[selected.ordinal].selected()
-        }
-    }
+    fun createChannelSelector(): CategorySelector? = createSelector(
+        data.channels,
+        intl["filter.category-type.channels.title"],
+        CategoryType.CHANNEL,
+    )
 
-    class CategorySelector(name: String, values: Array<CategoryOption>) : Filter.Select<CategoryOption>(name, values) {
-        fun selected() = values[state]
-    }
-
-    companion object {
-        fun createSortSelector(intl: Intl) = SortSelector(
-            intl["filter.time.title"],
-            arrayOf(
-                SortOption(intl["filter.time.option.popular"]),
-                SortOption(intl["filter.time.option.recent"], "recent?date=latest"),
-            ),
-        )
-
-        fun createActiveCategoryTypeSelector(intl: Intl) = ActiveCategoryTypeSelector(
-            intl["filter.active-category-type.title"],
-            arrayOf(
-                ActiveCategoryOption(intl["filter.active-category-type.option.recommend"], CategoryType.RECOMMEND),
-                ActiveCategoryOption(intl["filter.active-category-type.option.categories"], CategoryType.CATEGORY),
-                ActiveCategoryOption(intl["filter.active-category-type.option.tags"], CategoryType.TAG),
-                ActiveCategoryOption(intl["filter.active-category-type.option.porn-star"], CategoryType.PORN_STAR),
-                ActiveCategoryOption(intl["filter.active-category-type.option.channels"], CategoryType.CHANNEL),
-            ),
-        )
-
-        fun createRecommendSelector(intl: Intl): CategorySelector {
-            val options = JsonFileLoader.loadLangJsonAs<List<RecommendCategoryDto>>(
-                "recommend_categories",
-                intl.chosenLanguage,
-            )
-                .map { CategoryOption(it.name, CategoryType.of(it.categoryTypeName), it.link) }
-                .sortedBy { it.name }
-                .toTypedArray()
-            return CategorySelector(
-                intl["filter.category-type.recommend.title"],
-                options,
-            )
-        }
-
-        fun createCategorySelector(intl: Intl): CategorySelector {
-            val options = JsonFileLoader.loadLangJsonAs<List<CategoryDto>>("categories", intl.chosenLanguage)
-                .map { CategoryOption(it.name, CategoryType.CATEGORY, it.link) }
-                .sortedBy { it.name }
-                .toTypedArray()
-            return CategorySelector(
-                intl["filter.category-type.categories.title"],
-                options,
-            )
-        }
-
-        fun createTagSelector(intl: Intl): CategorySelector {
-            val options = JsonFileLoader.loadLangJsonAs<List<CategoryDto>>("tags", intl.chosenLanguage)
-                .map { CategoryOption(it.name, CategoryType.TAG, it.link) }
-                .sortedBy { it.name }
-                .toTypedArray()
-            return CategorySelector(
-                intl["filter.category-type.tags.title"],
-                options,
-            )
-        }
-
-        fun createPornStarSelector(intl: Intl): CategorySelector {
-            val options = JsonFileLoader.loadLangJsonAs<List<CategoryDto>>("porn_stars", intl.chosenLanguage)
-                .map { CategoryOption(it.name, CategoryType.PORN_STAR, it.link) }
-                .sortedBy { it.name }
-                .toTypedArray()
-            return CategorySelector(
-                intl["filter.category-type.porn-star.title"],
-                options,
-            )
-        }
-
-        fun createChannelSelector(intl: Intl): CategorySelector {
-            val options = JsonFileLoader.loadLangJsonAs<List<CategoryDto>>("channels", intl.chosenLanguage)
-                .map { CategoryOption(it.name, CategoryType.CHANNEL, it.link) }
-                .sortedBy { it.name }
-                .toTypedArray()
-            return CategorySelector(
-                intl["filter.category-type.channels.title"],
-                options,
-            )
-        }
-    }
+    private fun createSelector(
+        options: List<CategoryDto>,
+        title: String,
+        categoryType: CategoryType,
+    ): CategorySelector? = options
+        .sortedBy { it.name }
+        .map { CategoryOption(it.name, categoryType, it.link) }
+        .toTypedArray()
+        .takeIf { it.isNotEmpty() }
+        ?.let { CategorySelector(title, categoryType, it) }
 }

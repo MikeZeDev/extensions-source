@@ -1,11 +1,11 @@
 package eu.kanade.tachiyomi.extension.all.hentaienvy
 
 import eu.kanade.tachiyomi.multisrc.galleryadults.GalleryAdults
-import eu.kanade.tachiyomi.multisrc.galleryadults.Genre
 import eu.kanade.tachiyomi.multisrc.galleryadults.imgAttr
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import keiyoushi.annotation.Source
+import kotlinx.serialization.json.JsonElement
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
@@ -24,70 +24,50 @@ abstract class HentaiEnvy : GalleryAdults() {
         else -> throw IllegalArgumentException("Invalid lang: $lang")
     }
 
-    override val supportsLatest = mangaLang.isNotBlank()
+    override val supportsLatest get() = mangaLang.isNotBlank()
     override val supportAdvancedSearch = true
     override val supportSpeechless = true
 
-    override fun Element.mangaLang() = selectFirst(".flag a")?.attr("href")
-        ?.removeSuffix("/")
-        ?.substringAfterLast("/")
-        ?.let {
-            // Include Speechless in search results
-            if (it == LANGUAGE_SPEECHLESS) mangaLang else it
-        } ?: mangaLang
+    override fun Element.mangaLang() = select(".hnv-gallery-card__flag").attr("href")
+        .removeSuffix("/").substringAfterLast("/")
 
-    override fun Element.mangaTitle(selector: String): String? = mangaFullTitle(selector.takeIf { it != ".caption" } ?: ".title").let {
-        if (preferences.shortTitle) it?.shortenTitle() else it
-    }
+    override fun popularMangaSelector() = ".hnv-gallery-card"
 
-    override fun Element.mangaUrl() = selectFirst("a:has(.th_img)")?.attr("abs:href")
+    override fun Element.mangaThumbnail() = selectFirst("a.hnv-gallery-card__cover img")?.imgAttr()
 
-    override fun Element.mangaThumbnail() = selectFirst("a:has(.th_img) img")?.imgAttr()
+    override val mangaTitleSelector = ".hnv-gallery-card__title"
 
-    override val basicSearchKey = "s_key"
+    override fun Element.mangaUrl() = selectFirst("a.hnv-gallery-card__cover")?.attr("abs:href")
+
+    override val basicSearchKey = "key"
     override val advancedSearchUri = "advanced-search"
     override val favoritePath = "inc/user.php?act=favs"
 
     /* Details */
-    override fun Element.getInfo(tag: String): String = select("ul:has(.tag_title:contains($tag:)) a.gp_tag")
-        .joinToString {
-            val name = it.ownText()
-            if (tag.contains(regexTag)) {
-                genres[name] = it.attr("href")
-                    .removeSuffix("/")
-                    .substringAfterLast('/')
-            }
-            listOf(
-                name,
-                it.select(".split_tag").text()
-                    .trim()
-                    .removePrefix("| "),
-            )
-                .filter(String::isNotBlank)
-                .joinToString()
-        }
+    override val mangaDetailInfoSelector = ".hnv-gallery-details"
 
-    override fun Element.getCover() = selectFirst(".gt_left img")?.imgAttr()
+    override fun getInfoSelector(tag: String) = "div.hnv-gallery-entity-group:has(:contains($tag:)) a.hnv-gallery-tag"
+    override fun Element.infoTagName() = selectFirst(".hnv-gallery-tag__name")?.text() ?: ownText()
+
+    override fun Element.getCover() = selectFirst(".hnv-gallery-cover img")?.imgAttr()
 
     /* Pages */
-    override val thumbnailSelector = ".th_gp"
+    override fun Element.galleryId() = select("[data-gallery-id]").attr("data-gallery-id")
+    override fun Element.totalPages() = select("[data-total-pages]").attr("data-total-pages")
 
-    override fun tagsParser(document: Document): List<Genre> = document.select(".tags_items a.tgl_btn")
-        .mapNotNull {
-            Genre(
-                it.ownText(),
-                it.attr("href")
-                    .removeSuffix("/")
-                    .substringAfterLast('/'),
-            )
+    override val parsingImagePageByPage = true
+
+    /* Filters */
+    override fun tagsParser(document: Document) = document.select("ul.hnv-legacy-taxonomy__items a")
+        .associate {
+            it.attr("title") to it.attr("href").removeSuffix("/").substringAfterLast('/')
         }
 
-    override fun getFilterList() = FilterList(
+    override fun getFilterList(data: JsonElement?) = FilterList(
         listOf(
-            Filter.Header("HINT: Separate search term with comma (,)"),
             Filter.Header("String query search doesn't support Sort"),
-        ) + super.getFilterList().list,
+        ) + super.getFilterList(data).list,
     )
 
-    override fun relatedMangaSelector() = ".related_thumbs ${popularMangaSelector()}"
+    override val supportRelatedMangasBySearch = true
 }

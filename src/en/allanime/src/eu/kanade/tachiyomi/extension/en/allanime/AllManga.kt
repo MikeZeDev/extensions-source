@@ -13,13 +13,14 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
-import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
 import keiyoushi.network.get
 import keiyoushi.network.post
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.GraphQLException
+import keiyoushi.utils.asJsoup
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.graphQLBody
@@ -33,12 +34,13 @@ import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
 
 @Source
 abstract class AllManga :
     KeiSource(),
     ConfigurableSource {
-
     private val apiDomain get() = "api.mkissa.net"
 
     private val apiUrl get() = "https://$apiDomain/api"
@@ -65,7 +67,7 @@ abstract class AllManga :
             ),
         )
 
-        client.post(apiUrl, payload).use { response ->
+        client.post(apiUrl, Fetch.XHR, payload).use { response ->
             val data = response.parseGraphQLAs<PopularData>()
 
             val mangaList = data.popular.mangas
@@ -99,7 +101,7 @@ abstract class AllManga :
             ),
         )
 
-        client.post(apiUrl, payload).use { response ->
+        client.post(apiUrl, Fetch.XHR, payload).use { response ->
             val data = response.parseGraphQLAs<SearchData>()
 
             val mangaList = data.mangas.edges
@@ -112,9 +114,6 @@ abstract class AllManga :
     }
 
     override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
-        if (url.host != baseUrl.toHttpUrl().host) {
-            throw Exception("Unsupported url")
-        }
         val id = url.pathSegments.getOrNull(1)
             ?: throw Exception("Unsupported url")
 
@@ -127,14 +126,14 @@ abstract class AllManga :
 
     override fun getFilterList(data: JsonElement?) = getFilters()
 
-    override fun getMangaUrl(manga: SManga): String {
-        if (manga.url.startsWith("/")) {
-            val mangaId = manga.url.split("/")[2]
-            return "$baseUrl/manga/$mangaId"
-        } else {
-            return "$baseUrl/manga/${manga.url}"
-        }
-    }
+    var wvChapterUrl: String? = null
+
+    override fun getMangaUrl(manga: SManga) = wvChapterUrl ?: if (manga.url.startsWith("/")) {
+        val mangaId = manga.url.split("/")[2]
+        "$baseUrl/manga/$mangaId"
+    } else {
+        "$baseUrl/manga/${manga.url}"
+    } + "?fromSearch=1"
 
     override suspend fun fetchMangaUpdate(
         manga: SManga,
@@ -147,12 +146,20 @@ abstract class AllManga :
             val parts = manga.url.split("/")
             parts[2] to parts[3]
         } else {
-            manga.url to manga.memo["slug"]!!.string
+            manga.url to manga.memo["slug"]?.string
         }
 
         val payload = graphQLBody(
             query = UPDATE_QUERY,
-            variables = MangaUpdateVariables(mangaId, "manga@$mangaId"),
+            variables = MangaUpdateVariables(
+                mangaId,
+                "manga@$mangaId",
+                // Manga = null for some if not present
+                mapOf(
+                    "fromSearch" to true,
+                    "allowAdult" to true,
+                ),
+            ),
         )
 
         var data: MangaUpdateData? = null
@@ -161,7 +168,7 @@ abstract class AllManga :
         for (attempt in 0..MAX_RETRIES) {
             if (attempt > 0) delay(retryDelay)
             try {
-                val result = client.post(apiUrl, payload).parseGraphQLAs<MangaUpdateData>()
+                val result = client.post(apiUrl, Fetch.XHR, payload).parseGraphQLAs<MangaUpdateData>()
                 if (result.manga != null) {
                     data = result
                     break
@@ -218,7 +225,7 @@ abstract class AllManga :
             ),
         )
 
-        val data = client.post(apiUrl, payload).parseGraphQLAs<RelatedData>()
+        val data = client.post(apiUrl, Fetch.XHR, payload).parseGraphQLAs<RelatedData>()
 
         return (data.mangasWithIds.orEmpty() + data.search?.edges.orEmpty() + data.fewerGenresSearch?.edges.orEmpty())
             .distinctBy { it.id }
@@ -243,10 +250,10 @@ abstract class AllManga :
             .map { (('a'..'z') + ('A'..'Z')).random() }
             .joinToString("")
         val mangaId = chapter.memo["mangaId"]?.string ?: throw Exception("Refresh Chapter List")
-        val mangaUrl = "$baseUrl/manga/$mangaId"
+        val mangaUrl = "$baseUrl/manga/$mangaId?fromSearch=1"
         val chapterUrl = getChapterUrl(chapter).toHttpUrl().encodedPath
 
-        val document = client.get(mangaUrl, ensureSuccess = false).use { response ->
+        val document = client.get(mangaUrl, Fetch.DOCUMENT, ensureSuccess = false).use { response ->
             if (!response.isSuccessful) {
                 if (response.code == 403 || response.code == 503) {
                     throw Exception("Solve captcha in WebView and retry")
@@ -264,7 +271,7 @@ abstract class AllManga :
                         Response.prototype.json = function() {
                             return originalJson.call(this).then(data => {
                                 if (data && data.chapterPages) {
-                                    window.$interfaceName.post(JSON.stringify(data));
+                                    window.$interfaceName.postMessage(JSON.stringify(data));
                                 }
                                 return data;
                             });
@@ -275,7 +282,7 @@ abstract class AllManga :
                             apply(target, thisArg, args) {
                                 const result = Reflect.apply(target, thisArg, args);
                                 if (result && result.chapterPages) {
-                                    window.$interfaceName.post(args[0]);
+                                    window.$interfaceName.postMessage(String(args[0]));
                                 }
                                 return result;
                             }
@@ -304,7 +311,7 @@ abstract class AllManga :
             }
         }
 
-        val payload = runWebView {
+        val payload = runWebView(timeout = 20.seconds) {
             blockImages = true
             userAgent = headers["User-Agent"]!!
 
@@ -318,7 +325,7 @@ abstract class AllManga :
                     }
 
                    let checkAttempts = 0;
-                   const maxAttempts = 300; // 15 seconds
+                   const maxAttempts = 200; // 10 seconds
 
                    function check() {
                        if (document.querySelector('[data-href]')) {
@@ -336,12 +343,39 @@ abstract class AllManga :
                 })();
             """.trimIndent()
 
-            jsBridge(interfaceName) {
+            webMessageBridge(interfaceName, setOf(baseUrl)) {
+                wvChapterUrl = null
                 resolve(it)
             }
 
             onPageStarted {
+                evaluateJs(
+                    "localStorage.clear(); sessionStorage.clear()",
+                )
                 evaluateJs(script)
+            }
+
+            interceptRequest {
+                if (it.url.toString().contains("/mreferer/")) {
+                    error("Failed to attach listener")
+                }
+                null
+            }
+
+            var captchaAttempts = 0
+
+            poll(250.milliseconds) {
+                evaluateJs(
+                    """
+                     document.title.includes("Just a moment") ||
+                    document.querySelector('.captcha-overlay--visible') != null
+                    """.trimIndent(),
+                ) { result ->
+                    if (result == "true" && ++captchaAttempts >= 20) { // 5s
+                        wvChapterUrl = "$baseUrl$chapterUrl"
+                        error("Solve captcha in WebView and retry")
+                    }
+                }
             }
 
             loadData(mangaUrl, document.outerHtml())
@@ -382,11 +416,11 @@ abstract class AllManga :
         }
     }
 
-    override fun imageRequest(page: Page): Request {
+    override fun getImageRequest(page: Page): Request {
         val quality = preferences.imageQuality
 
         if (quality == IMAGE_QUALITY_PREF_DEFAULT) {
-            return super.imageRequest(page)
+            return super.getImageRequest(page)
         }
 
         val oldUrl = imageQualityRegex.find(page.imageUrl!!)!!.groupValues[1]

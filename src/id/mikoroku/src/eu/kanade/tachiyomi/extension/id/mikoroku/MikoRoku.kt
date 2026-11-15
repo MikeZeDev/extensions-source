@@ -1,91 +1,281 @@
 package eu.kanade.tachiyomi.extension.id.mikoroku
 
-import eu.kanade.tachiyomi.multisrc.zeistmanga.Genre
-import eu.kanade.tachiyomi.multisrc.zeistmanga.Status
-import eu.kanade.tachiyomi.multisrc.zeistmanga.ZeistManga
+import eu.kanade.tachiyomi.source.model.FilterList
+import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
+import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.util.asJsoup
+import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
-import okhttp3.Response
+import keiyoushi.network.Fetch
+import keiyoushi.network.get
+import keiyoushi.source.KeiSource
+import keiyoushi.utils.parseAs
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import org.jsoup.Jsoup
 
 @Source
-abstract class MikoRoku : ZeistManga() {
+abstract class MikoRoku : KeiSource() {
+    override suspend fun getPopularManga(page: Int): MangasPage = fetchCatalog()
+        .sortedByDescending { it.rating }
+        .toMangasPage()
 
-    override fun popularMangaRequest(page: Int) = latestUpdatesRequest(page)
-    override fun popularMangaParse(response: Response) = searchMangaParse(response)
+    override suspend fun getLatestUpdates(page: Int): MangasPage = fetchCatalog().toMangasPage()
 
-    override val hasFilters = true
-    override val hasLanguageFilter = false
-    override val hasTypeFilter = false
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
+        val normalizedQuery = query.normalize()
+        if (normalizedQuery.isEmpty() && query.isNotBlank()) return MangasPage(emptyList(), false)
 
-    override fun getStatusList() = listOf(
-        Status("Semua", ""),
-        Status("Ongoing", "Ongoing"),
-        Status("Completed", "Completed"),
-        Status("Hiatus", "Hiatus"),
-        Status("Dropped", "Dropped"),
-    )
+        return fetchCatalog()
+            .filter { entry ->
+                entry.title.normalize().contains(normalizedQuery) ||
+                    entry.altTitle.split(";").any { it.normalize().contains(normalizedQuery) }
+            }
+            .toMangasPage()
+    }
 
-    override fun getGenreList() = listOf(
-        Genre("Action", "Action"),
-        Genre("Adventure", "Adventure"),
-        Genre("Comedy", "Comedy"),
-        Genre("Dark Fantasy", "Dark Fantasy"),
-        Genre("Drama", "Drama"),
-        Genre("Fantasy", "Fantasy"),
-        Genre("Historical", "Historical"),
-        Genre("Horror", "Horror"),
-        Genre("Isekai", "Isekai"),
-        Genre("Magic", "Magic"),
-        Genre("Mecha", "Mecha"),
-        Genre("Military", "Military"),
-        Genre("Mystery", "Mystery"),
-        Genre("Psychological", "Psychological"),
-        Genre("Romance", "Romance"),
-        Genre("School Life", "School Life"),
-        Genre("Sci-Fi", "Sci-Fi"),
-        Genre("Seinen", "Seinen"),
-        Genre("Shounen", "Shounen"),
-        Genre("Slice of Life", "Slice of Life"),
-        Genre("Supernatural", "Supernatural"),
-        Genre("Survival", "Survival"),
-        Genre("Tragedy", "Tragedy"),
-    )
+    private fun List<CatalogEntry>.toMangasPage() = MangasPage(map { it.toSManga() }, false)
 
-    override fun mangaDetailsParse(response: Response): SManga {
-        val document = response.asJsoup()
-        val header = document.selectFirst("header[itemprop=mainEntity]")
-            ?: document.selectFirst("header.bg-white")!!
+    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
+        if (url.host.removePrefix("www.") != baseUrl.toHttpUrl().host.removePrefix("www.")) return null
+        val slug = url.queryParameter("slug") ?: return null
 
+        return buildManga(slug, fetchFirestoreDoc(slug)).apply { initialized = true }
+    }
+
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
+        val slug = "$baseUrl${manga.url}".toHttpUrl().queryParameter("slug")
+            ?: throw Exception("Invalid manga URL: ${manga.url}")
+
+        val doc = fetchFirestoreDoc(slug)
+        val details = buildManga(slug, doc)
+
+        return SMangaUpdate(manga = details, chapters = fetchChapterList(slug, doc, details.title))
+    }
+
+    private suspend fun buildManga(slug: String, doc: FirestoreMap?): SManga {
+        val fields = doc?.fields.orEmpty()
+        val entry = fetchCatalog().find { it.slug == slug }
         return SManga.create().apply {
-            thumbnail_url = header.selectFirst("img.thumb")?.attr("abs:src")
-            title = header.selectFirst("h1[itemprop=name]")?.text()!!
-            status = parseStatus(header.selectFirst("span[data-status]")?.text()!!)
-            description = document.selectFirst("#synopsis")?.ownText()?.trim()
-            author = document.select("#extra-info .y6x11p")
-                .firstOrNull { it.ownText().contains("Author", ignoreCase = true) }
-                ?.selectFirst("span.dt")?.text()
+            url = "/detail.html?slug=$slug"
+            title = fields.getString("title").nonBlank()
+                ?: entry?.title
+                ?: throw Exception("Manga tidak ditemukan")
+            author = fields.getString("author").nonBlank() ?: entry?.author.nonBlank()
+            artist = fields.getString("artist").nonBlank() ?: entry?.artist.nonBlank()
+            description = fields.getString("desc").nonBlank()?.let { Jsoup.parseBodyFragment(it).text() }
+                ?: entry?.desc.nonBlank()
+            genre = fields.getStringList("genres").takeIf { it.isNotEmpty() }?.joinToString()
+                ?: entry?.genres?.takeIf { it.isNotEmpty() }?.joinToString()
+            status = (fields.getString("status") ?: entry?.status).toMangaStatus()
+            thumbnail_url = fields.getString("img").nonBlank() ?: entry?.img.nonBlank()
         }
     }
 
-    override val chapterCategory: String = "Chapter"
+    private fun String?.toMangaStatus(): Int = when (this?.lowercase()) {
+        "ongoing" -> SManga.ONGOING
+        "completed" -> SManga.COMPLETED
+        "hiatus" -> SManga.ON_HIATUS
+        "dropped", "cancelled" -> SManga.CANCELLED
+        else -> SManga.UNKNOWN
+    }
 
-    override fun pageListParse(response: Response): List<Page> {
-        val document = response.asJsoup()
-        val images = when {
-            document.selectFirst("div.check-box") != null ->
-                document.select("div.check-box div.separator img[src]")
-            document.selectFirst("div[data=imageProtection]") != null ->
-                document.select("div[data=imageProtection] div.separator img[src]")
-            document.selectFirst("#post-body div.separator") != null ->
-                document.select("#post-body div.separator img[src]")
-            else ->
-                document.select(".post-body div.separator img[src]")
+    private suspend fun fetchChapterList(slug: String, doc: FirestoreMap?, title: String): List<SChapter> {
+        val subcollectionChapters = fetchChaptersSubcollection(slug)
+        val fieldChapters = doc?.toChapterInfos().orEmpty()
+            .sortedWith(compareByDescending<ChapterInfo> { it.number }.thenByDescending { it.order })
+            .map { it.toSChapter(slug) }
+        val firestoreChapters = (subcollectionChapters + fieldChapters)
+            .distinctBy { it.name.chapterNumber() }
+
+        val blogger1 = searchBlogger(
+            "https://www.mikodrive.my.id/feeds/posts/default",
+            title,
+            500,
+        ).mapNotNull { it.toSChapter(slug, title) }
+        val blogger2 = searchBlogger(
+            "https://www.yomidays.my.id/feeds/posts/default",
+            title,
+            500,
+        ).mapNotNull { it.toSChapter(slug, title) }
+        val seen = firestoreChapters.mapTo(mutableSetOf()) { it.name.chapterNumber() }
+        val merged = firestoreChapters.toMutableList()
+        for (ch in blogger1 + blogger2) {
+            if (seen.add(ch.name.chapterNumber())) merged.add(ch)
+        }
+        return merged.sortedByDescending { it.name.chapterNumber() }
+    }
+
+    private suspend fun fetchChaptersSubcollection(slug: String): List<SChapter> {
+        val url = "https://firestore.googleapis.com/v1/projects/mikoroku/databases/(default)/documents/manga/$slug/chapters?pageSize=500"
+
+        val response = client.get(url, Fetch.XHR, ensureSuccess = false)
+        if (response.code != 200) {
+            response.close()
+            return emptyList()
+        }
+        return response.parseAs<FirestoreListResponse>().documents.mapNotNull { doc ->
+            val fields = doc.fields
+            if (fields.getBoolean("isDraft") == true) return@mapNotNull null
+            val title = fields.getString("title")?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val key = doc.name.substringAfterLast("/")
+            SChapter.create().apply {
+                name = title
+                date_upload = fields.getLong("date") ?: 0L
+                this.url = "/manga/$slug/chapter/$key"
+            }
+        }
+    }
+
+    private fun FirestoreMap.toChapterInfos(): List<ChapterInfo> = fields
+        .filterKeys { it.startsWith("chapters.") }
+        .mapNotNull { (key, value) ->
+            val chapter = value.mapValue?.fields ?: return@mapNotNull null
+            if (chapter.getBoolean("isDraft") == true) return@mapNotNull null
+
+            ChapterInfo(
+                key = key.removePrefix("chapters."),
+                title = chapter.getString("title").nonBlank() ?: return@mapNotNull null,
+                date = chapter.getLong("date") ?: 0L,
+                order = chapter.getLong("order") ?: 0L,
+            )
         }
 
-        return images.mapIndexed { index, img ->
-            Page(index, imageUrl = img.attr("abs:src"))
+    private class ChapterInfo(
+        val key: String,
+        val title: String,
+        val date: Long,
+        val order: Long,
+    ) {
+        val number = title.chapterNumber()
+
+        fun toSChapter(slug: String) = SChapter.create().apply {
+            name = title
+            date_upload = date
+            url = "/manga/$slug/chapter/$key"
         }
+    }
+
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        POST_URL_REGEX.find(chapter.url)?.let { match ->
+            return fetchBloggerPostPages(match.groupValues[2])
+        }
+
+        val (slug, key) = CHAPTER_URL_REGEX.find(chapter.url)?.destructured
+            ?: throw Exception("Unsupported chapter URL: ${chapter.url}")
+
+        fetchFirestorePages(slug, key)?.let { return it }
+
+        val title = fetchCatalog().find { it.slug == slug }?.title ?: return emptyList()
+        return fetchBloggerChapterPages(title, chapter.name)
+    }
+
+    private suspend fun fetchFirestorePages(slug: String, key: String): List<Page>? {
+        val subcollectionImages = run {
+            val url = "https://firestore.googleapis.com/v1/projects/mikoroku/databases/(default)/documents/manga/$slug/chapters/$key"
+            val response = client.get(url, Fetch.XHR, ensureSuccess = false)
+            if (response.code != 200) {
+                response.close()
+                null
+            } else {
+                response.parseAs<FirestoreDoc>().fields.getStringList("images").takeIf { it.isNotEmpty() }
+            }
+        }
+        if (!subcollectionImages.isNullOrEmpty()) {
+            return subcollectionImages.toPages()
+        }
+
+        val fieldImages = fetchFirestoreDoc(slug)
+            ?.fields?.get("chapters.$key")
+            ?.mapValue?.fields
+            ?.getStringList("images")
+            .orEmpty()
+        if (fieldImages.isEmpty()) return null
+
+        return fieldImages.toPages()
+    }
+
+    private suspend fun fetchBloggerPostPages(postId: String): List<Page> {
+        val url = "https://www.mikodrive.my.id/feeds/posts/default/$postId".toHttpUrl().newBuilder()
+            .addQueryParameter("alt", "json")
+            .build()
+
+        return client.get(url, Fetch.XHR).parseAs<BloggerEntryResponse>().entry.imageUrls().toPages()
+    }
+
+    private suspend fun fetchBloggerChapterPages(mangaTitle: String, chapterName: String): List<Page> {
+        val label = chapterName.chapterLabel() ?: return emptyList()
+        val number = label.chapterNumber()
+
+        return searchBlogger("https://www.mikodrive.my.id/feeds/posts/default", "$mangaTitle $label", 5)
+            .firstOrNull { it.chapterLabel(mangaTitle)?.chapterNumber() == number }
+            ?.imageUrls()
+            .orEmpty()
+            .toPages()
+    }
+
+    private fun List<String>.toPages(): List<Page> = mapIndexed { index, url -> Page(index, imageUrl = url) }
+
+    private suspend fun fetchCatalog(): List<CatalogEntry> {
+        val catalog = client.get("https://raw.githubusercontent.com/moemaomao/mymangadata/main/all-manga.json", Fetch.XHR).parseAs<List<CatalogEntry>>()
+        return catalog
+    }
+
+    private suspend fun fetchFirestoreDoc(slug: String): FirestoreMap? {
+        val url = "https://firestore.googleapis.com/v1/projects/mikoroku/databases/(default)/documents/manga/$slug"
+
+        val response = client.get(url, Fetch.XHR, ensureSuccess = false)
+        if (response.code != 200) {
+            response.close()
+            return null
+        }
+        return response.parseAs<FirestoreMap>()
+    }
+
+    private suspend fun searchBlogger(feedUrl: String, query: String, maxResults: Int): List<BloggerEntry> {
+        searchBloggerWithQuery(feedUrl, query, maxResults).takeIf { it.isNotEmpty() }?.let { return it }
+
+        // Blogger's q= doesn't match "2" with "II", so retry with the
+        // trailing number/roman numeral stripped (e.g. "isekai furin 2" -> "isekai furin").
+        val stripped = query.replace(Regex("\\s+(\\d+|[ivxl]+)$", RegexOption.IGNORE_CASE), "").trim()
+        if (stripped.isNotBlank() && stripped != query) {
+            searchBloggerWithQuery(feedUrl, stripped, maxResults).takeIf { it.isNotEmpty() }?.let { return it }
+        }
+
+        // For conversion mismatches (e.g. "konten" vs "tamashiten"),
+        // trying progressively shorter queries. The titleWordsMatch filter in toSChapter will reject false positives.
+        val words = query.split(Regex("\\s+")).filter { it.isNotBlank() }
+        for (n in listOf(4, 3)) {
+            if (words.size > n) {
+                val short = words.take(n).joinToString(" ")
+                searchBloggerWithQuery(feedUrl, short, maxResults).takeIf { it.isNotEmpty() }?.let { return it }
+            }
+        }
+        return emptyList()
+    }
+
+    private suspend fun searchBloggerWithQuery(feedUrl: String, query: String, maxResults: Int): List<BloggerEntry> {
+        val url = feedUrl.toHttpUrl().newBuilder()
+            .addQueryParameter("alt", "json")
+            .addQueryParameter("max-results", maxResults.toString())
+            .addQueryParameter("q", query)
+            .build()
+
+        return client.get(url, Fetch.XHR).parseAs<BloggerFeedResponse>().feed.entry
+    }
+
+    private fun String.normalize(): String = normalized()
+
+    private fun String?.nonBlank(): String? = this?.takeIf { it.isNotBlank() }
+
+    companion object {
+        private val CHAPTER_URL_REGEX = """/manga/([^/]+)/chapter/([^/]+)""".toRegex()
+        private val POST_URL_REGEX = """/manga/([^/]+)/post/([^/]+)""".toRegex()
     }
 }

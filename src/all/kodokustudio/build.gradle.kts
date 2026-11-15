@@ -6,13 +6,18 @@ plugins {
 
 keiyoushi {
     name = "Kodoku Studio"
-    versionCode = 0
-    contentWarning = ContentWarning.SAFE
-    libVersion = "1.4"
-    theme = "madara"
+    versionCode = 57
+    contentWarning = ContentWarning.MIXED
+    libVersion = "1.6"
 
     source {
         lang = "all"
-        baseUrl = "https://kodokustudio.com"
+        baseUrl = "https://kodokueasyaccess.com"
+        versionId = 2
+    }
+
+    deeplink {
+        path("/manhwa/..*")
+        path("/read/..*")
     }
 }

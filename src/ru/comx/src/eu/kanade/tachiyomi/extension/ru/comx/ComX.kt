@@ -13,15 +13,18 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
-import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
 import keiyoushi.network.get
 import keiyoushi.network.post
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
+import keiyoushi.utils.asJsoup
 import keiyoushi.utils.getPreferences
 import keiyoushi.utils.parseAs
+import keiyoushi.utils.ratingStars
 import keiyoushi.utils.toJsonElement
+import keiyoushi.utils.tryParseDate
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.buildJsonObject
 import okhttp3.FormBody
@@ -31,8 +34,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import java.time.LocalDate
-import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.util.Calendar
 import java.util.Locale
@@ -41,7 +42,6 @@ import java.util.Locale
 abstract class ComX :
     KeiSource(),
     ConfigurableSource {
-
     private val preferences: SharedPreferences = getPreferences()
 
     override fun OkHttpClient.Builder.configureClient() = apply {
@@ -64,7 +64,7 @@ abstract class ComX :
                 addPathSegments("page/$page")
                 addPathSegment("")
             }.build()
-            return parseSearchMangas(client.get(url))
+            return parseSearchMangas(client.get(url, Fetch.DOCUMENT))
         }
 
         var orderBy = "rating"
@@ -120,7 +120,7 @@ abstract class ComX :
             .add("set_direction_sort", "dle_direction_xfilter")
             .build()
 
-        return parseSearchMangas(client.post(url, body))
+        return parseSearchMangas(client.post(url, Fetch.DOCUMENT, body))
     }
 
     // ============================== Search Utilities ===============================
@@ -140,7 +140,7 @@ abstract class ComX :
             .add("set_direction_sort", "dle_direction_cat_1")
             .build()
 
-        return parseSearchMangas(client.post(url, body))
+        return parseSearchMangas(client.post(url, Fetch.DOCUMENT, body))
     }
 
     fun parseSearchMangas(response: Response): MangasPage {
@@ -172,7 +172,7 @@ abstract class ComX :
     override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
         if (url.host != baseUrl.toHttpUrl().host) return null
         url.pathSegments.firstOrNull() ?: return null
-        return parseMangaDetails(client.get(url).asJsoup(), url.encodedPath)
+        return parseMangaDetails(client.get(url, Fetch.DOCUMENT).asJsoup(), url.encodedPath)
     }
 
     override suspend fun fetchMangaUpdate(
@@ -181,7 +181,7 @@ abstract class ComX :
         fetchDetails: Boolean,
         fetchChapters: Boolean,
     ): SMangaUpdate {
-        val doc = client.get("$baseUrl/${manga.url}", ensureSuccess = false).use { response ->
+        val doc = client.get(baseUrl + manga.url, Fetch.DOCUMENT, ensureSuccess = false).use { response ->
             if (!response.isSuccessful) {
                 if (response.code == 403) {
                     throw Exception("Контент не доступен. Возможно может помочь авторизация через WebView")
@@ -201,19 +201,6 @@ abstract class ComX :
 
         val ratingValue = (doc.selectFirst(".page__activity-votes")?.ownText()?.trim()?.toFloatOrNull() ?: 0f) * 2
         val ratingVotes = doc.selectFirst(".page__activity-votes span > span")?.text()?.trim() ?: "0"
-        val ratingStar = when {
-            ratingValue > 9.5 -> "★★★★★"
-            ratingValue > 8.5 -> "★★★★✬"
-            ratingValue > 7.5 -> "★★★★☆"
-            ratingValue > 6.5 -> "★★★✬☆"
-            ratingValue > 5.5 -> "★★★☆☆"
-            ratingValue > 4.5 -> "★★✬☆☆"
-            ratingValue > 3.5 -> "★★☆☆☆"
-            ratingValue > 2.5 -> "★✬☆☆☆"
-            ratingValue > 1.5 -> "★☆☆☆☆"
-            ratingValue > 0.5 -> "✬☆☆☆☆"
-            else -> "☆☆☆☆☆"
-        }
 
         description = buildString {
             doc.selectFirst(".page__title-original")?.text()?.takeIf { it.isNotBlank() }?.let {
@@ -224,7 +211,7 @@ abstract class ComX :
                 append("Cобытие в комиксах - ХРОНОЛОГИЯ")
                 appendLine()
             }
-            append(ratingStar).append(" ").append(ratingValue).append(" (голосов: ").append(ratingVotes).append(")\n")
+            append(ratingStars(ratingValue.toDouble())).append(" ").append(ratingValue).append(" (голосов: ").append(ratingVotes).append(")\n")
             appendLine()
             append(doc.selectFirst("div.page__text")?.text())
         }
@@ -254,9 +241,10 @@ abstract class ComX :
     }
 
     // ============================== Manga Utilities ===============================
-    private fun Document.getPageListItem(label: String): String? = selectFirst(".page__list > li:has(> div:contains($label))")
-        ?.ownText()
-        ?.takeIf { it.isNotBlank() }
+    private fun Document.getPageListItem(label: String): String? = selectFirst(".page__list > li:has(> div:contains($label))")?.let { element ->
+        element.selectFirst("a")?.text() ?: element.ownText()
+    }?.takeIf { it.isNotBlank() }
+
     private fun parseStatus(element: String?): Int = when {
         element.isNullOrBlank() -> SManga.UNKNOWN
         element.contains("Продолжается") || element.contains(" из ") || element.contains("Онгоинг") -> SManga.ONGOING
@@ -291,9 +279,7 @@ abstract class ComX :
         return data.chapters.asReversed().map { chap ->
             SChapter.create().apply {
                 url = "/reader/${data.comicId}/${chap.id}"
-                date_upload = runCatching {
-                    LocalDate.parse(chap.date, dateFormat).atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli()
-                }.getOrDefault(0L)
+                date_upload = dateFormat.tryParseDate(chap.date)
 
                 val matchNumber = chapterNumberRegex.find(chap.title)?.groupValues[1]?.toFloatOrNull()
                 val anyNumber = chapterAnyNumberRegex.find(chap.title)?.groupValues[1]?.toFloatOrNull()
@@ -305,7 +291,9 @@ abstract class ComX :
                         if (matchNumber != null && (matchNumber - counter) in 0f..1f) {
                             matchNumber
                         } else {
-                            if (isExtraChapter(chap.title)) {
+                            // Extra have a certain word in title or contains exactly `# 1` in title.
+                            // Regex should exclude any #1.0, #12 but match `#1-`, `#1:` or `# 1 `.
+                            if (isExtraChapter(chap.title) || noInfoExtra.containsMatchIn(chap.title)) {
                                 counter + 0.1f
                             } else {
                                 if (anyNumber != null && (anyNumber - counter) in 0f..1f) {
@@ -360,7 +348,7 @@ abstract class ComX :
 
     // =============================== Pages ===============================
     override suspend fun getPageList(chapter: SChapter): List<Page> {
-        val document = client.get("$baseUrl${chapter.url}", ensureSuccess = false).use { response ->
+        val document = client.get("$baseUrl${chapter.url}", Fetch.DOCUMENT, ensureSuccess = false).use { response ->
             if (!response.isSuccessful) {
                 if (response.code == 304 || response.code == 302 || response.code == 403) {
                     throw Exception("Глава не доступна. Возможно может помочь авторизация через WebView")
@@ -404,7 +392,7 @@ abstract class ComX :
     override val supportsFilterFetching = true
 
     override suspend fun fetchFilterData(): JsonElement {
-        val doc = client.get("$baseUrl/comix-read/").asJsoup()
+        val doc = client.get("$baseUrl/comix-read/", Fetch.DOCUMENT).asJsoup()
         val script = doc.selectFirst("script:containsData(window.__XFILTER__)")?.data()
             ?: error("Filter data not found")
 
@@ -488,6 +476,7 @@ abstract class ComX :
         private const val FORCE_IMG_DOMAIN_PREF = "FORCE_IMG_DOMAIN_PREF"
         private val chapterNumberRegex = """(?:\d+\s*-|.*?Глава)\s*([\d.]+)""".toRegex()
         private val chapterAnyNumberRegex = """([\d.]+)""".toRegex()
+        private val noInfoExtra = """#\s?1(?!\d|\.\d)""".toRegex()
         private val whitespacesRegex = """\s{2,}""".toRegex()
     }
 }

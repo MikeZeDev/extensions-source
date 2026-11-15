@@ -6,9 +6,9 @@ plugins {
 
 keiyoushi {
     name = "Akuma"
-    versionCode = 10
+    versionCode = 11
     contentWarning = ContentWarning.NSFW
-    libVersion = "1.4"
+    libVersion = "1.6"
 
     listOf(
         "all", "en", "id", "jv", "ca", "ceb", "cs", "da", "de", "et", "es", "eo",

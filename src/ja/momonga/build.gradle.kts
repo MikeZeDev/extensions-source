@@ -8,7 +8,7 @@ keiyoushi {
     name = "MomonGA"
     versionCode = 1
     contentWarning = ContentWarning.NSFW
-    libVersion = "1.4"
+    libVersion = "1.6"
 
     source {
         name = "momon:GA"

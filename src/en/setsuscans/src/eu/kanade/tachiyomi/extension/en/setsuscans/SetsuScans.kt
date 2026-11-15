@@ -2,14 +2,17 @@ package eu.kanade.tachiyomi.extension.en.setsuscans
 
 import eu.kanade.tachiyomi.multisrc.madara.Madara
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
+import keiyoushi.network.fetch
 import keiyoushi.network.rateLimit
 import okhttp3.Interceptor
+import okhttp3.OkHttpClient
 import okhttp3.Response
 
 @Source
 abstract class SetsuScans : Madara() {
-    override val client = super.client.newBuilder()
-        .addNetworkInterceptor { chain ->
+    override fun OkHttpClient.Builder.configureClient() = apply {
+        addNetworkInterceptor { chain ->
             val request = chain.request()
             val url = request.url
             if (url.host == "i0.wp.com") {
@@ -26,9 +29,9 @@ abstract class SetsuScans : Madara() {
 
             return@addNetworkInterceptor chain.proceed(request)
         }
-        .addInterceptor(::handleFailedImages)
-        .rateLimit(2)
-        .build()
+        addInterceptor(::handleFailedImages)
+        rateLimit(2)
+    }
 
     private fun handleFailedImages(chain: Interceptor.Chain): Response {
         val response: Response = chain.proceed(chain.request())
@@ -50,14 +53,14 @@ abstract class SetsuScans : Madara() {
 
             val newRequest = chain.request().newBuilder()
                 .url(newUrl.build())
+                .fetch(Fetch.IMAGE)
                 .build()
             return client.newCall(newRequest).execute()
         }
         return response
     }
 
-    override val useNewChapterEndpoint = true
-    override val useLoadMoreRequest = LoadMoreStrategy.Always
+    override val chapterMode = ChapterMode.MangaAjax
 
     override val mangaDetailsSelectorStatus = "div.summary-heading:contains(status) + div.summary-content"
 }

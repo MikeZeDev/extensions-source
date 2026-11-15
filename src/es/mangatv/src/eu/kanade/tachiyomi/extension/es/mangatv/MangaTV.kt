@@ -2,23 +2,20 @@ package eu.kanade.tachiyomi.extension.es.mangatv
 
 import android.util.Base64
 import eu.kanade.tachiyomi.multisrc.mangathemesia.MangaThemesia
-import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.Page
 import keiyoushi.annotation.Source
 import keiyoushi.lib.unpacker.Unpacker
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonPrimitive
+import keiyoushi.utils.aesDecrypt
+import keiyoushi.utils.aesGcm
+import keiyoushi.utils.parseAs
+import kotlinx.serialization.Serializable
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Request
 import org.jsoup.nodes.Document
-import java.text.SimpleDateFormat
-import java.util.Locale
 
 @Source
 abstract class MangaTV : MangaThemesia() {
     override val mangaUrlDirectory = "/lista"
-    override val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.ROOT)
+    override val datePattern = "yyyy-MM-dd"
 
     override val seriesDescriptionSelector = "b:contains(Sinopsis) + span"
     override fun chapterListSelector() = "#chapterlist ul.clstyle li:has(.dt a)"
@@ -27,31 +24,45 @@ abstract class MangaTV : MangaThemesia() {
         val unpackedScript = document.selectFirst("script:containsData(eval)")!!.data()
             .let(Unpacker::unpack)
 
+        READER_BLOB_REGEX.find(unpackedScript)?.destructured?.toList()?.get(0)
+            ?.parseAs<ReaderBlob>()
+            ?.let { return decryptReaderBlob(it).mapIndexed { i, url -> Page(i, imageUrl = url) } }
+
         val imageListJson = JSON_IMAGE_LIST_REGEX.find(unpackedScript)?.destructured?.toList()?.get(0).orEmpty()
-        val imageList = try {
-            json.parseToJsonElement(imageListJson.replace(TRAILING_COMMA_REGEX, "]")).jsonArray
-        } catch (_: IllegalArgumentException) {
-            emptyList()
-        }
-        return imageList.mapIndexed { i, jsonEl ->
-            val encodedLink = jsonEl.jsonPrimitive.content
-            val decodedLink = String(Base64.decode(encodedLink, Base64.DEFAULT))
-            Page(i, document.location(), "https:$decodedLink")
+        val imageList = runCatching {
+            imageListJson.replace(TRAILING_COMMA_REGEX, "]").parseAs<List<String>>()
+        }.getOrElse { emptyList() }
+        return imageList.mapIndexed { i, url ->
+            val decodedLink = String(Base64.decode(url, Base64.DEFAULT))
+            Page(i, imageUrl = "https:$decodedLink")
         }
     }
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val url = baseUrl.toHttpUrl().newBuilder()
-            .addPathSegment(mangaUrlDirectory.substring(1))
-            .addQueryParameter("s", query)
-            .addQueryParameter("page", page.toString())
-        return GET(url.build(), headers)
+    private fun decryptReaderBlob(blob: ReaderBlob): List<String> {
+        val cipher = aesGcm(Base64.decode(blob.k, Base64.DEFAULT), Base64.decode(blob.iv, Base64.DEFAULT))
+        val plaintext = Base64.decode(blob.c, Base64.DEFAULT).aesDecrypt(cipher).decodeToString()
+        return plaintext.parseAs<ReaderImages>().p
     }
 
-    // TODO: add demografia, order, tipos, genre
-    override fun getFilterList() = FilterList()
+    override fun searchMangaUrl(page: Int, query: String) = baseUrl.toHttpUrl().newBuilder()
+        .addPathSegment(mangaUrlDirectory.substring(1))
+        .addQueryParameter("s", query)
+        .addQueryParameter("page", page.toString())
 
     companion object {
         val TRAILING_COMMA_REGEX = """,\s+]""".toRegex()
+        val READER_BLOB_REGEX = """ReaderBlob\.start\((\{.+?\})\)""".toRegex()
     }
+}
+
+@Serializable
+class ReaderBlob {
+    val k: String = ""
+    val iv: String = ""
+    val c: String = ""
+}
+
+@Serializable
+class ReaderImages {
+    val p: List<String> = emptyList()
 }

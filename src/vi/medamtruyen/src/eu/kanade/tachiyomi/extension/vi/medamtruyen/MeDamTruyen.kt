@@ -7,16 +7,20 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
-import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
 import keiyoushi.network.get
 import keiyoushi.network.post
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
+import keiyoushi.utils.asJsoup
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonElement
+import keiyoushi.utils.tryParseDate
+import keiyoushi.utils.ui.askPassword
 import kotlinx.serialization.json.JsonElement
+import okhttp3.CacheControl
 import okhttp3.FormBody
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -24,9 +28,9 @@ import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
@@ -58,7 +62,7 @@ abstract class MeDamTruyen : KeiSource() {
     // ============================== Popular ===============================
 
     override suspend fun getPopularManga(page: Int): MangasPage {
-        val document = client.get(baseUrl).asJsoup()
+        val document = client.get(baseUrl, Fetch.DOCUMENT).asJsoup()
         val mangas = document.select("#day-charts .sidebar-comic-block")
             .mapNotNull(::popularMangaFromElement)
             .distinctBy { it.url }
@@ -84,7 +88,7 @@ abstract class MeDamTruyen : KeiSource() {
             .addQueryParameter("trang", page.toString())
             .build()
 
-        return parseBrowsePage(client.get(url))
+        return parseBrowsePage(client.get(url, Fetch.DOCUMENT))
     }
 
     // ============================== Search ================================
@@ -96,7 +100,7 @@ abstract class MeDamTruyen : KeiSource() {
                 .add("keyword", query)
                 .build()
 
-            return parseSearchApiResponse(client.post("$baseUrl/wp-admin/admin-ajax.php", body = formBody))
+            return parseSearchApiResponse(client.post("$baseUrl/wp-admin/admin-ajax.php", Fetch.XHR, body = formBody))
         }
 
         val filterPath = filters.firstInstanceOrNull<GenreFilter>()?.toUriPart()
@@ -108,7 +112,7 @@ abstract class MeDamTruyen : KeiSource() {
                 .addQueryParameter("trang", page.toString())
                 .build()
 
-            return parseBrowsePage(client.get(url))
+            return parseBrowsePage(client.get(url, Fetch.XHR))
         }
 
         return getLatestUpdates(page)
@@ -176,7 +180,7 @@ abstract class MeDamTruyen : KeiSource() {
         val detailUrl = if (pathSegments.firstOrNull() == "truyen") {
             url
         } else if (isChapterUrl) {
-            client.get(url).asJsoup()
+            client.get(url, Fetch.DOCUMENT).asJsoup()
                 .selectFirst("a[href*=/truyen/]:matchesOwn(^DS\\. Chương$), a[href*=/truyen/]")
                 ?.absUrl("href")
                 ?.toHttpUrl()
@@ -203,7 +207,7 @@ abstract class MeDamTruyen : KeiSource() {
         fetchDetails: Boolean,
         fetchChapters: Boolean,
     ): SMangaUpdate {
-        val document = client.get(getMangaUrl(manga)).asJsoup()
+        val document = client.get(getMangaUrl(manga), Fetch.DOCUMENT).asJsoup()
         return SMangaUpdate(
             manga = parseMangaDetails(document, manga),
             chapters = parseChapterList(document),
@@ -263,10 +267,13 @@ abstract class MeDamTruyen : KeiSource() {
     private fun chapterFromElement(element: Element): SChapter? {
         val linkElement = element.selectFirst("a.chapter-link[href*=-chap-]") ?: return null
         val rawChapterName = element.selectFirst("p.chapter-title")?.text() ?: linkElement.text()
+        val isLocked = linkElement.selectFirst(".glyphicon-lock, .fa-lock, .icon-lock") != null ||
+            element.selectFirst(".glyphicon-lock, .fa-lock, .icon-lock") != null
 
         return SChapter.create().apply {
             setUrlWithoutDomain(linkElement.absUrl("href"))
-            name = normalizeChapterName(rawChapterName)
+            val normalizedName = normalizeChapterName(rawChapterName)
+            name = if (isLocked) "🔒 $normalizedName" else normalizedName
             date_upload = element.selectFirst("p.chapter-meta")
                 ?.text()
                 ?.let(::parseChapterDate)
@@ -285,24 +292,51 @@ abstract class MeDamTruyen : KeiSource() {
             .replace(multiSpaceRegex, " ")
     }
 
-    private fun parseChapterDate(chapterMeta: String): Long {
-        val dateString = chapterDateRegex.find(chapterMeta)?.value ?: return 0L
-        return runCatching {
-            LocalDate.parse(dateString, chapterDateFormat)
-                .atStartOfDay(dateZone)
-                .toInstant()
-                .toEpochMilli()
-        }.getOrDefault(0L)
-    }
+    private fun parseChapterDate(chapterMeta: String): Long = chapterDateFormat.tryParseDate(chapterDateRegex.find(chapterMeta)?.value, dateZone)
 
     // ============================== Pages =================================
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
-        val response = client.get(getChapterUrl(chapter))
-        val chapterUrl = response.request.url.toString()
-        val html = response.use { it.body.string() }
-        if (passwordFormRegex.containsMatchIn(html)) {
-            throw Exception(passwordWebviewMessage)
+        val chapterUrl = getChapterUrl(chapter)
+        // Locked pages are cacheable (max-age, no Vary: Cookie) — skip disk cache.
+        val response = client.get(chapterUrl, Fetch.DOCUMENT, CacheControl.FORCE_NETWORK)
+        var html = response.body.string()
+        var document = Jsoup.parse(html, chapterUrl)
+
+        val lockForm = document.selectFirst("form.post-password-form")
+        if (lockForm != null) {
+            val hint = extractHintText(document)
+            val message = if (!hint.isNullOrBlank()) {
+                "Chương này yêu cầu mật khẩu\n\n$hint"
+            } else {
+                "Chương này yêu cầu mật khẩu"
+            }
+            val password = askPassword(
+                title = chapter.name,
+                message = message,
+                hint = "Mật khẩu",
+            ) ?: throw Exception("Đã hủy nhập mật khẩu")
+
+            val postAction = lockForm.absUrl("action").ifEmpty {
+                "$baseUrl/wp-login.php?action=postpass"
+            }
+            val formBody = FormBody.Builder()
+                .add("post_password", password)
+                .add("redirect_to", chapterUrl)
+                .add("Submit", "Nhập")
+                .build()
+
+            val postHeaders = headers.newBuilder()
+                .set("Referer", chapterUrl)
+                .build()
+
+            client.post(postAction, postHeaders, Fetch.DOCUMENT, formBody, ensureSuccess = false).close()
+            html = client.get(chapterUrl, Fetch.DOCUMENT, CacheControl.FORCE_NETWORK).body.string()
+
+            document = Jsoup.parse(html, chapterUrl)
+            if (document.selectFirst("form.post-password-form") != null) {
+                throw Exception("Mật khẩu không chính xác")
+            }
         }
 
         val imageUrls = ImageDecryptor.extractImageUrls(html, chapterUrl)
@@ -313,7 +347,14 @@ abstract class MeDamTruyen : KeiSource() {
         }
     }
 
-    override fun imageRequest(page: Page): Request {
+    private fun extractHintText(document: Document): String? {
+        val raw = document.selectFirst("p:contains(Gợi ý)")?.text()
+            ?: document.select("*:containsOwn(Gợi ý)").firstOrNull()?.parent()?.text()
+            ?: return null
+        return raw.replaceFirst(hintColonRegex, "$1\n").trim()
+    }
+
+    override fun getImageRequest(page: Page): Request {
         val imageHeaders = headers.newBuilder()
             .set("Referer", page.url)
             .build()
@@ -325,7 +366,7 @@ abstract class MeDamTruyen : KeiSource() {
 
     override val supportsFilterFetching get() = true
 
-    override suspend fun fetchFilterData() = client.get(baseUrl).asJsoup().let { document ->
+    override suspend fun fetchFilterData() = client.get(baseUrl, Fetch.DOCUMENT).asJsoup().let { document ->
         FilterData(
             genres = parseFilterOptions(document, "#genre-tab"),
             groups = parseFilterOptions(document, "#team-tab"),
@@ -346,7 +387,7 @@ abstract class MeDamTruyen : KeiSource() {
     override val supportsRelatedMangas get() = true
 
     override suspend fun fetchRelatedMangaList(manga: SManga): List<SManga> {
-        val document = client.get(getMangaUrl(manga)).asJsoup()
+        val document = client.get(getMangaUrl(manga), Fetch.DOCUMENT).asJsoup()
         val relatedList = document.select("h3")
             .firstOrNull { it.text().equals("Truyện Liên Quan", ignoreCase = true) }
             ?.parent()
@@ -367,7 +408,6 @@ abstract class MeDamTruyen : KeiSource() {
 
     private val thumbLowSize = "-150x150"
     private val thumbHighSize = "-720x970"
-    private val passwordWebviewMessage = "Vui lòng nhập mật khẩu của chương này qua webview"
 
     private val truyenPathRegex = Regex("""/truyen/""", RegexOption.IGNORE_CASE)
     private val chapterNameRegex = Regex(
@@ -378,11 +418,9 @@ abstract class MeDamTruyen : KeiSource() {
     private val chapterNumberRegex = Regex("""\d+(?:[.,]\d+)?""")
     private val chapterDateRegex = Regex("""\d{2}/\d{2}/\d{2}""")
     private val multiSpaceRegex = Regex("""\s+""")
-    private val passwordFormRegex = Regex(
-        """post-password-form|name=['"]post_password['"]""",
-        RegexOption.IGNORE_CASE,
-    )
     private val thumbFallbackMap = ConcurrentHashMap<String, String>()
     private val dateZone = ZoneId.of("Asia/Ho_Chi_Minh")
     private val chapterDateFormat = DateTimeFormatter.ofPattern("dd/MM/yy", Locale.ROOT)
+    private val passwordWebviewMessage = "Vui lòng nhập mật khẩu của chương này qua webview"
+    private val hintColonRegex = Regex("""(Gợi\s*ý\s*:?)\s*""", RegexOption.IGNORE_CASE)
 }

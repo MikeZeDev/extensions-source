@@ -1,43 +1,38 @@
 package eu.kanade.tachiyomi.extension.en.novelcrow
 
-import eu.kanade.tachiyomi.multisrc.madara.Madara
-import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.multisrc.madara.GenreRoute
+import eu.kanade.tachiyomi.multisrc.madara.MadaraNoAjax
+import eu.kanade.tachiyomi.source.model.FilterList
+import eu.kanade.tachiyomi.source.model.MangasPage
 import keiyoushi.annotation.Source
-import okhttp3.Request
-import org.jsoup.nodes.Element
+import keiyoushi.network.Fetch
+import keiyoushi.network.get
+import keiyoushi.utils.asJsoup
+import keiyoushi.utils.toJsonElement
+import kotlinx.serialization.json.JsonElement
 
 @Source
-abstract class NovelCrow : Madara() {
-
-    override val useNewChapterEndpoint = true
-
+abstract class NovelCrow : MadaraNoAjax() {
     override val mangaSubString = "comic"
+    override val genreDirectory = "comic-genre"
+    override val chapterMode = ChapterMode.MangaAjax
+    override val mangaDetailsSelectorAuthor = "div.artist-content > a"
 
-    override val chapterUrlSuffix = ""
-
-    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/${searchPage(page)}?s=&post_type=wp-manga&m_orderby=trending", headers)
-
-    override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/${searchPage(page)}?s=&post_type=wp-manga&m_orderby=latest", headers)
-
-    override fun searchMangaSelector() = popularMangaSelector()
-
-    override fun imageFromElement(element: Element): String? {
-        val image = super.imageFromElement(element)?.trim()
-
-        if (image.isNullOrEmpty()) {
-            val url = element.attr("data-src").trim().takeIf { it.isNotEmpty() }
-                ?: element.attr("data-lazy-src").trim().takeIf { it.isNotEmpty() }
-                ?: element.attr("src").trim().takeIf { it.isNotEmpty() }
-
-            if (url != null) {
-                return if (url.startsWith("http") || url.startsWith("data:")) {
-                    url
-                } else {
-                    if (url.startsWith("/")) baseUrl + url else "$baseUrl/$url"
-                }
-            }
-        }
-
-        return image
+    // /comic/ archive 404s, the search page lists everything instead
+    override fun archiveUrlBuilder(page: Int, order: String, path: String, query: String) = if (path == "/$mangaSubString/") {
+        searchUrlBuilder(page, query).apply { if (order.isNotBlank()) addQueryParameter(orderQueryParameter, order) }
+    } else {
+        super.archiveUrlBuilder(page, order, path, query)
     }
+
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage = if (query.isBlank()) {
+        super.getSearchMangaList(page, query, filters)
+    } else {
+        archivePage(page, "", query = query)
+    }
+
+    override suspend fun fetchFilterData(): JsonElement = client.get(searchUrlBuilder(1, "").build(), Fetch.DOCUMENT).asJsoup()
+        .select("input[name='genre[]']")
+        .map { GenreRoute(it.parent()!!.text(), it.attr("value"), "/$genreDirectory/${it.attr("value")}/") }
+        .toJsonElement()
 }

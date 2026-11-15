@@ -6,18 +6,21 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
-import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
 import keiyoushi.network.get
 import keiyoushi.network.post
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
+import keiyoushi.utils.asJsoup
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonElement
+import keiyoushi.utils.tryParseDate
+import keiyoushi.utils.ui.askPassword
 import kotlinx.serialization.json.JsonElement
+import okhttp3.CacheControl
 import okhttp3.FormBody
-import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
@@ -25,7 +28,6 @@ import okhttp3.Response
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
@@ -34,8 +36,6 @@ import java.util.Locale
 abstract class TeamLanhLung : KeiSource() {
 
     override fun OkHttpClient.Builder.configureClient() = rateLimit(3)
-
-    override fun Headers.Builder.configureHeaders() = set("Referer", "$baseUrl/")
 
     private fun Element.lazyImgUrl(): String? {
         val url = absUrl("data-lazy-src")
@@ -49,7 +49,7 @@ abstract class TeamLanhLung : KeiSource() {
     // ============================== Popular ===============================
 
     override suspend fun getPopularManga(page: Int): MangasPage {
-        val document = client.get("$baseUrl/xem-nhieu-nhat/").asJsoup()
+        val document = client.get("$baseUrl/xem-nhieu-nhat/", Fetch.DOCUMENT).asJsoup()
         val mangas = document.select("ul.most-views.single-list-comic li.position-relative")
             .map(::mangaFromListItem)
         return MangasPage(mangas, hasNextPage = false)
@@ -68,7 +68,7 @@ abstract class TeamLanhLung : KeiSource() {
 
     override suspend fun getLatestUpdates(page: Int): MangasPage {
         val url = if (page == 1) baseUrl else "$baseUrl/page/$page/"
-        return parseLatestPage(client.get(url).asJsoup())
+        return parseLatestPage(client.get(url, Fetch.DOCUMENT).asJsoup())
     }
 
     private fun parseLatestPage(document: Document): MangasPage {
@@ -103,7 +103,7 @@ abstract class TeamLanhLung : KeiSource() {
                 .add("action", "searchtax")
                 .add("keyword", query)
                 .build()
-            return parseSearchResponse(client.post("$baseUrl/wp-admin/admin-ajax.php", formBody))
+            return parseSearchResponse(client.post("$baseUrl/wp-admin/admin-ajax.php", Fetch.XHR, formBody))
         }
 
         val filterPath = filters.firstInstanceOrNull<GenreFilter>()?.toUriPart().orEmpty()
@@ -113,7 +113,7 @@ abstract class TeamLanhLung : KeiSource() {
 
         if (filterPath.isNotEmpty()) {
             val pagePath = if (page == 1) filterPath else "${filterPath.trimEnd('/')}/page/$page/"
-            return parseArchivePage(client.get(baseUrl + pagePath).asJsoup())
+            return parseArchivePage(client.get(baseUrl + pagePath, Fetch.DOCUMENT).asJsoup())
         }
 
         return getLatestUpdates(page)
@@ -158,7 +158,7 @@ abstract class TeamLanhLung : KeiSource() {
         val mangaUrl = if (url.pathSegments.firstOrNull() == "truyen-tranh") {
             url
         } else {
-            client.get(url).asJsoup()
+            client.get(url, Fetch.DOCUMENT).asJsoup()
                 .selectFirst(".breadcrumb a[href*='/truyen-tranh/']")
                 ?.absUrl("href")
                 ?.toHttpUrl()
@@ -175,7 +175,7 @@ abstract class TeamLanhLung : KeiSource() {
         fetchDetails: Boolean,
         fetchChapters: Boolean,
     ): SMangaUpdate {
-        val document = client.get(getMangaUrl(manga)).asJsoup()
+        val document = client.get(getMangaUrl(manga), Fetch.DOCUMENT).asJsoup()
         return SMangaUpdate(
             manga = parseMangaDetails(document, manga),
             chapters = if (fetchChapters) parseChapterList(document) else chapters,
@@ -225,7 +225,7 @@ abstract class TeamLanhLung : KeiSource() {
             ?.ifEmpty { null }
 
         while (nextPage != null && visited.add(nextPage)) {
-            document = client.get(nextPage).asJsoup()
+            document = client.get(nextPage, Fetch.DOCUMENT).asJsoup()
             chapters += document.select(".chapter-table table tbody tr").mapNotNull(::parseChapterElement)
             nextPage = document.selectFirst("ul.pager li.next:not(.disabled) a")
                 ?.absUrl("href")
@@ -264,23 +264,49 @@ abstract class TeamLanhLung : KeiSource() {
         return rawName.substringAfterLast("–").substringAfterLast("-").trim()
     }
 
-    private fun parseChapterDate(date: String): Long = runCatching {
-        LocalDate.parse(date, dateFormatFull).atStartOfDay(dateZone).toInstant().toEpochMilli()
-    }.recoverCatching {
-        LocalDate.parse(date, dateFormatShort).atStartOfDay(dateZone).toInstant().toEpochMilli()
-    }.getOrDefault(0L)
+    private fun parseChapterDate(date: String): Long = dateFormatFull.tryParseDate(date, dateZone).takeIf { it != 0L }
+        ?: dateFormatShort.tryParseDate(date, dateZone)
 
     // ============================== Pages ===============================
 
-    override suspend fun getPageList(chapter: SChapter): List<Page> = client.get(getChapterUrl(chapter)).use { response ->
-        val html = response.body.string()
-        val document = Jsoup.parse(html, response.request.url.toString())
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val chapterUrl = getChapterUrl(chapter)
+        // Locked pages are cacheable (max-age, no Vary: Cookie) — skip disk cache.
+        val response = client.get(chapterUrl, Fetch.DOCUMENT, CacheControl.FORCE_NETWORK)
+        var html = response.body.string()
+        var document = Jsoup.parse(html, chapterUrl)
 
-        if (document.selectFirst("form.post-password-form") != null) {
-            throw Exception(passwordWebViewMessage)
+        val lockForm = document.selectFirst("form.post-password-form")
+        if (lockForm != null) {
+            val password = askPassword(
+                title = chapter.name,
+                message = "Chương này yêu cầu mật khẩu",
+                hint = "Mật khẩu",
+            ) ?: throw Exception("Đã hủy nhập mật khẩu")
+
+            val postAction = lockForm.absUrl("action").ifEmpty {
+                "$baseUrl/wp-login.php?action=postpass"
+            }
+            val formBody = FormBody.Builder()
+                .add("post_password", password)
+                .add("redirect_to", chapterUrl)
+                .add("Submit", "Nhập")
+                .build()
+
+            val postHeaders = headers.newBuilder()
+                .set("Referer", chapterUrl)
+                .build()
+
+            client.post(postAction, postHeaders, Fetch.DOCUMENT, formBody, ensureSuccess = false).close()
+            html = client.get(chapterUrl, Fetch.DOCUMENT, CacheControl.FORCE_NETWORK).body.string()
+
+            document = Jsoup.parse(html, chapterUrl)
+            if (document.selectFirst("form.post-password-form") != null) {
+                throw Exception("Mật khẩu không chính xác")
+            }
         }
 
-        ImageDecryptor.extractImageUrls(html).mapIndexed { index, imageUrl ->
+        return ImageDecryptor.extractImageUrls(html).mapIndexed { index, imageUrl ->
             Page(index, imageUrl = imageUrl)
         }
     }
@@ -294,7 +320,7 @@ abstract class TeamLanhLung : KeiSource() {
     override val supportsFilterFetching get() = true
 
     override suspend fun fetchFilterData(): JsonElement {
-        val document = client.get(baseUrl).asJsoup()
+        val document = client.get(baseUrl, Fetch.DOCUMENT).asJsoup()
         return FilterData(
             genres = document.parseFilterOptions("#nav-tags"),
             teams = document.parseFilterOptions("#nav-teams"),
@@ -318,7 +344,7 @@ abstract class TeamLanhLung : KeiSource() {
     override val supportsRelatedMangas get() = true
 
     override suspend fun fetchRelatedMangaList(manga: SManga): List<SManga> {
-        val document = client.get(getMangaUrl(manga)).asJsoup()
+        val document = client.get(getMangaUrl(manga), Fetch.DOCUMENT).asJsoup()
         val relatedSection = document.select("h3.blue-title")
             .firstOrNull { it.text().equals("Truyện liên quan", ignoreCase = true) }
             ?.nextElementSibling()
@@ -327,7 +353,6 @@ abstract class TeamLanhLung : KeiSource() {
         return relatedSection.select(".comic-item").map(::mangaFromComicItem).distinctBy { it.url }
     }
 
-    private val passwordWebViewMessage = "Vui lòng nhập mật khẩu của chương này qua webview"
     private val dateFormatFull = DateTimeFormatter.ofPattern("dd/MM/yyyy", Locale.ROOT)
     private val dateFormatShort = DateTimeFormatter.ofPattern("dd/MM/yy", Locale.ROOT)
     private val dateZone = ZoneId.of("Asia/Ho_Chi_Minh")

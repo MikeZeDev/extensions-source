@@ -6,9 +6,9 @@ plugins {
 
 keiyoushi {
     name = "Hunters Scans"
-    versionCode = 11
+    versionCode = 12
     contentWarning = ContentWarning.MIXED
-    libVersion = "1.4"
+    libVersion = "1.6"
     theme = "madara"
 
     source {

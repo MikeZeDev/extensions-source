@@ -11,8 +11,15 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import eu.kanade.tachiyomi.source.online.HttpSource
+import keiyoushi.network.BaseUrlFetchInterceptor
+import keiyoushi.network.BrowserCallInterceptor
+import keiyoushi.network.BrowserHeadersInterceptor
 import keiyoushi.network.CacheControlInterceptor
+import keiyoushi.network.Deflate
+import keiyoushi.network.Fetch
 import keiyoushi.network.RateLimitInterceptor
+import keiyoushi.network.fetch
+import keiyoushi.network.kind
 import keiyoushi.utils.applicationContext
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.jsonInstance
@@ -20,30 +27,35 @@ import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.okio.decodeFromBufferedSource
 import kotlinx.serialization.json.okio.encodeToBufferedSink
 import okhttp3.CompressionInterceptor
+import okhttp3.Dispatcher
 import okhttp3.Gzip
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
-import okhttp3.Response
+import okhttp3.Request
 import okhttp3.brotli.Brotli
 import okhttp3.brotli.BrotliInterceptor
 import okhttp3.zstd.Zstd
 import okio.buffer
 import okio.sink
 import okio.source
-import rx.Observable
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.time.Duration.Companion.days
+import kotlin.time.Duration.Companion.seconds
+
+private val BASE_URL_FETCH_TIMEOUT = 10.seconds
 
 abstract class KeiSource : HttpSource() {
 
@@ -102,6 +114,11 @@ abstract class KeiSource : HttpSource() {
                 }
             }
 
+            // first, so source interceptors only see the fetched url
+            fetchableBaseUrl?.let { preferences ->
+                addInterceptor(BaseUrlFetchInterceptor({ baseUrl }) { fetchBaseUrlsBlocking(preferences) })
+            }
+
             configureClient()
 
             // cf interceptor below source specific interceptors
@@ -114,11 +131,15 @@ abstract class KeiSource : HttpSource() {
                 }
             }
 
-            // last application interceptor
-            addInterceptor(CompressionInterceptor(Brotli, Gzip, Zstd))
+            // the browser headers for requests with a Fetch
+            addInterceptor(BrowserCallInterceptor({ baseUrl }, { imageFetch }))
+            // last application interceptor; the encodings and order browsers send
+            addInterceptor(CompressionInterceptor(Gzip, Deflate, Brotli, Zstd))
 
             // allow caching when server doesn't explicitly say anything
             addNetworkInterceptor(CacheControlInterceptor())
+
+            addNetworkInterceptor(BrowserHeadersInterceptor)
 
             // keep the source's rate limiter as the last network interceptor
             networkInterceptors().apply {
@@ -132,16 +153,49 @@ abstract class KeiSource : HttpSource() {
     }
 
     /**
+     * Base url preferences of a source overriding [fetchBaseUrls].
+     * Do not override by hand.
+     */
+    protected open val fetchableBaseUrl: FetchableBaseUrl? get() = null
+
+    /**
+     * Fetches the site's current base urls, in the site's order: one url, or every mirror it lists.
+     *
+     * Needs a `mirrors(...)` or `custom(...)` baseUrl. Runs once per source per app launch, before its first request:
+     * the urls replace the mirror list, or the first one becomes the custom url and its default.
+     *
+     * @param client the client to use for the lookup: requests on [KeiSource.client] wait for it to finish.
+     */
+    protected open suspend fun fetchBaseUrls(client: OkHttpClient): List<String> = emptyList()
+
+    private fun fetchBaseUrlsBlocking(preferences: FetchableBaseUrl) {
+        // Without the interceptor that waits for this lookup, and with its own request slots
+        val lookupClient = client.newBuilder()
+            .dispatcher(Dispatcher())
+            .callTimeout(BASE_URL_FETCH_TIMEOUT)
+            .apply { interceptors().removeAll { it is BaseUrlFetchInterceptor } }
+            .build()
+        try {
+            val urls = runBlocking { withTimeout(BASE_URL_FETCH_TIMEOUT) { fetchBaseUrls(lookupClient) } }
+                .mapNotNull { it.toHttpUrlOrNull()?.resolve("/")?.toString()?.removeSuffix("/") }
+                .distinct()
+            if (urls.isNotEmpty()) preferences.update(urls)
+        } catch (e: Exception) {
+            Log.e(name, "Failed to fetch base urls", e)
+        }
+    }
+
+    /**
      * Customizes the base Headers builder. Subclasses can override this to append source-specific
      * headers.
      *
-     * Note: "User-Agent", "Referer", and "Origin" are already added by default.
+     * Note: `User-Agent` and `Referer` are set here. The other browser headers, `Origin` included, are added per
+     * request kind; headers set here or on a request are kept.
      */
     protected open fun Headers.Builder.configureHeaders(): Headers.Builder = this
 
     final override fun headersBuilder() = super.headersBuilder()
         .set("Referer", "$baseUrl/")
-        .set("Origin", baseUrl)
         .configureHeaders()
 
     /**
@@ -209,12 +263,11 @@ abstract class KeiSource : HttpSource() {
     private val filterFetchInFlight = AtomicBoolean(false)
     private val filterFetchAttemptCount = AtomicInteger(0)
     private val maxFilterFetchAttempts = 3
-    private val filterCacheDir: File by lazy {
-        applicationContext.cacheDir.resolve("source_$id").apply { mkdirs() }
-    }
-    private val filterCacheFile: File by lazy {
+    private val filterCacheDir: File get() =
+        applicationContext.cacheDir.resolve("source_$id")
+            .apply { mkdirs() }
+    private val filterCacheFile: File get() =
         filterCacheDir.resolve("filters.json.zst")
-    }
 
     /**
      * Whether this source fetches its filters from the network
@@ -301,7 +354,6 @@ abstract class KeiSource : HttpSource() {
     }
 
     private fun writeFilterCache(data: JsonElement) {
-        filterCacheDir.mkdirs()
         val tmpFile = File.createTempFile("filters", ".tmp", filterCacheDir)
 
         try {
@@ -371,7 +423,8 @@ abstract class KeiSource : HttpSource() {
     ): SMangaUpdate {
         check(fetchDetails || fetchChapters) { "getMangaUpdate called with nothing to fetch (fetchDetails=false, fetchChapters=false)" }
 
-        check(updatesInFlight.putIfAbsent(manga.url, true) == null) { "getMangaUpdate must not be called concurrently for same manga" }
+        val key = manga.url
+        check(updatesInFlight.putIfAbsent(key, true) == null) { "getMangaUpdate must not be called concurrently for same manga" }
 
         try {
             val update = fetchMangaUpdate(manga, chapters, fetchDetails, fetchChapters)
@@ -381,7 +434,7 @@ abstract class KeiSource : HttpSource() {
                 chapters = update.chapters,
             )
         } finally {
-            updatesInFlight.remove(manga.url)
+            updatesInFlight.remove(key)
         }
     }
 
@@ -442,83 +495,26 @@ abstract class KeiSource : HttpSource() {
      */
     abstract override suspend fun getPageList(chapter: SChapter): List<Page>
 
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    @Suppress("DEPRECATION")
-    final override fun fetchPopularManga(page: Int): Observable<MangasPage> = super.fetchPopularManga(page)
+    /**
+     * How page images and the covers the app loads go out: [Fetch.IMAGE] sends the headers a browser sends for them;
+     * [Fetch.NONE] sends them as built.
+     */
+    protected open val imageFetch: Fetch get() = Fetch.IMAGE
 
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    final override fun popularMangaRequest(page: Int) = throw UnsupportedOperationException()
+    /**
+     * Builds the request for a page's image. A GET without a [Fetch] is sent with [imageFetch].
+     *
+     * @param page the page.
+     * @return the request for its image.
+     */
+    protected open fun getImageRequest(page: Page): Request = Request.Builder()
+        .url(page.imageUrl!!)
+        .headers(headers)
+        .build()
 
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    final override fun popularMangaParse(response: Response) = throw UnsupportedOperationException()
-
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    @Suppress("DEPRECATION")
-    final override fun fetchLatestUpdates(page: Int): Observable<MangasPage> = super.fetchLatestUpdates(page)
-
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    final override fun latestUpdatesRequest(page: Int) = throw UnsupportedOperationException()
-
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    final override fun latestUpdatesParse(response: Response) = throw UnsupportedOperationException()
-
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    @Suppress("DEPRECATION")
-    final override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> = super.fetchSearchManga(page, query, filters)
-
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    final override fun searchMangaRequest(page: Int, query: String, filters: FilterList) = throw UnsupportedOperationException()
-
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    final override fun searchMangaParse(response: Response) = throw UnsupportedOperationException()
-
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    @Suppress("DEPRECATION")
-    final override fun fetchMangaDetails(manga: SManga): Observable<SManga> = super.fetchMangaDetails(manga)
-
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    final override fun mangaDetailsRequest(manga: SManga) = throw UnsupportedOperationException()
-
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    final override fun mangaDetailsParse(response: Response) = throw UnsupportedOperationException()
-
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    final override fun relatedMangaListRequest(manga: SManga) = throw UnsupportedOperationException()
-
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    final override fun relatedMangaListParse(response: Response): List<SManga> = throw UnsupportedOperationException()
-
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    @Suppress("DEPRECATION")
-    final override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = super.fetchChapterList(manga)
-
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    final override fun chapterListRequest(manga: SManga) = throw UnsupportedOperationException()
-
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    final override fun chapterListParse(response: Response) = throw UnsupportedOperationException()
-
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    @Suppress("DEPRECATION")
-    final override fun prepareNewChapter(chapter: SChapter, manga: SManga) = super.prepareNewChapter(chapter, manga)
-
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    @Suppress("DEPRECATION")
-    final override fun fetchPageList(chapter: SChapter): Observable<List<Page>> = super.fetchPageList(chapter)
-
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    final override fun pageListRequest(chapter: SChapter) = throw UnsupportedOperationException()
-
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    final override fun pageListParse(response: Response) = throw UnsupportedOperationException()
-
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    @Suppress("DEPRECATION")
-    final override fun fetchImageUrl(page: Page): Observable<String> = super.fetchImageUrl(page)
-
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    final override fun imageUrlRequest(page: Page) = throw UnsupportedOperationException()
-
-    @Deprecated("Hidden", level = DeprecationLevel.HIDDEN)
-    final override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
+    final override fun imageRequest(page: Page): Request {
+        val request = getImageRequest(page)
+        val image = request.kind == null && request.method == "GET"
+        return if (image) request.newBuilder().fetch(imageFetch).build() else request
+    }
 }

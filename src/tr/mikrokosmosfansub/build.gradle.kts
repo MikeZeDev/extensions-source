@@ -6,13 +6,13 @@ plugins {
 
 keiyoushi {
     name = "Mikrokosmos Fansub"
-    versionCode = 1
+    versionCode = 18
     contentWarning = ContentWarning.NSFW
-    libVersion = "1.4"
-    theme = "zeistmanga"
+    libVersion = "1.6"
 
     source {
         lang = "tr"
-        baseUrl = "https://mikrokosmosfb.blogspot.com"
+        baseUrl = "https://mikrokosmos.fans"
+        versionId = 2
     }
 }
